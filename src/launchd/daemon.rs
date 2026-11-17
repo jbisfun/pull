@@ -92,6 +92,7 @@ impl Entry {
             foreground_cwd,
             attached: self.clients.lock().unwrap().len(),
             job: self.job.clone(),
+            pullfile: false,
         }
     }
 }

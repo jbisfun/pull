@@ -123,6 +123,10 @@ enum LaunchctlCmd {
     List {
         #[arg(long)]
         json: bool,
+        /// Also pullfile jobs that aren't loaded (state "unloaded"), and don't start the
+        /// daemon just to list.
+        #[arg(long)]
+        all: bool,
     },
     /// Everything about one job: state, program, environment, foreground program.
     Print {
@@ -828,10 +832,42 @@ fn launchctl(root: &Path, pf: &Pullfile, cmd: LaunchctlCmd) -> Result<()> {
         LaunchctlCmd::Unload { label } => {
             client::request(root, &Request::Unload { label })?;
         }
-        LaunchctlCmd::List { json } => {
-            let Response::Jobs(jobs) = client::request(root, &Request::List)? else {
-                bail!("unexpected reply");
+        LaunchctlCmd::List { json, all } => {
+            let mut jobs = if !all || client::running(root) {
+                let Response::Jobs(jobs) = client::request(root, &Request::List)? else {
+                    bail!("unexpected reply");
+                };
+                jobs
+            } else {
+                Vec::new()
             };
+            for j in &mut jobs {
+                j.pullfile = pf.jobs.iter().any(|p| p.label == j.label);
+            }
+            if all {
+                for job in &pf.jobs {
+                    if job.disabled || jobs.iter().any(|j| j.label == job.label) {
+                        continue;
+                    }
+                    jobs.push(launchd::JobStatus {
+                        label: job.label.clone(),
+                        pid: None,
+                        last_exit: None,
+                        runs: 0,
+                        state: "unloaded".into(),
+                        argv: job.argv(),
+                        cwd: job
+                            .working_directory
+                            .clone()
+                            .unwrap_or_else(|| root.display().to_string()),
+                        foreground: None,
+                        foreground_cwd: None,
+                        attached: 0,
+                        job: job.clone(),
+                        pullfile: true,
+                    });
+                }
+            }
             if json {
                 println!("{}", serde_json::to_string_pretty(&jobs)?);
             } else {

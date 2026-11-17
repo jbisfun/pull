@@ -169,6 +169,9 @@ pub struct JobStatus {
     pub foreground_cwd: Option<String>,
     pub attached: usize,
     pub job: Job,
+    /// Defined in the pullfile's `jobs` (as opposed to an ad-hoc session).
+    #[serde(default)]
+    pub pullfile: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
