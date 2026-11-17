@@ -100,6 +100,7 @@ pub fn attach(root: &Path, label: &str) -> Result<()> {
     terminal::enable_raw_mode()?;
     eprint!("\x1b]0;pull: {label}\x07");
     let mut from_daemon = s.try_clone()?;
+    let label_out = label.to_string();
     let output = std::thread::spawn(move || {
         let mut stdout = std::io::stdout();
         let mut buf = [0u8; 8192];
@@ -109,6 +110,11 @@ pub fn attach(root: &Path, label: &str) -> Result<()> {
             }
             stdout.flush().ok();
         }
+        // The session ended or was removed: the main thread is blocked reading stdin, so
+        // restore the terminal and exit from here.
+        terminal::disable_raw_mode().ok();
+        eprintln!("\r\n[session {label_out} ended]");
+        std::process::exit(0);
     });
     let mut to_daemon = s.try_clone()?;
     std::thread::spawn(move || {
@@ -140,10 +146,11 @@ pub fn attach(root: &Path, label: &str) -> Result<()> {
             }
             break;
         }
-        if s.write_all(&frame(FRAME_DATA, &buf[..n])).is_err() || output.is_finished() {
+        if s.write_all(&frame(FRAME_DATA, &buf[..n])).is_err() {
             break;
         }
     }
+    drop(output);
     s.shutdown(std::net::Shutdown::Both).ok();
     terminal::disable_raw_mode()?;
     eprintln!("\r\n[detached from {label}]");

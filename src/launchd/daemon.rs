@@ -347,7 +347,15 @@ impl Daemon {
                 }
                 Request::Unload { label } => {
                     self.stop(&label, false)?;
-                    self.jobs.lock().unwrap().remove(&label);
+                    if let Some(entry) = self.jobs.lock().unwrap().remove(&label) {
+                        // exited() won't find the entry anymore; disconnect attached
+                        // terminals now (shutdown also ends the daemon's reader on them).
+                        for (_, mut s) in entry.clients.lock().unwrap().drain(..) {
+                            s.write_all(format!("\r\n[pull: {label} removed]\r\n").as_bytes())
+                                .ok();
+                            s.shutdown(std::net::Shutdown::Both).ok();
+                        }
+                    }
                     Response::Ok
                 }
                 Request::List => Response::Jobs(
