@@ -18,6 +18,9 @@ pub struct Pullfile {
     pub lint: Lint,
     pub hooks: Hooks,
     pub repos: Vec<Repo>,
+    /// launchd jobs for this workspace (launchd plist keys), run by `pull launchd`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub jobs: Vec<crate::launchd::Job>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

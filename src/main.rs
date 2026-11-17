@@ -2,6 +2,7 @@ mod config;
 mod env;
 mod git;
 mod hooks;
+mod launchd;
 mod lint;
 mod worktree;
 
@@ -72,6 +73,16 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
     },
+    /// Run the workspace job daemon in the foreground (started automatically when needed).
+    #[command(hide = true)]
+    Launchd,
+    /// launchd-style job control: jobs from the pullfile `jobs` or launchd .plist files.
+    #[command(subcommand)]
+    Launchctl(LaunchctlCmd),
+    /// tmux-style terminal sessions (headless jobs a human can attach to and an agent can
+    /// drive), started with the workspace env.
+    #[command(subcommand)]
+    Session(SessionCmd),
     /// Workspace worktrees under .worktrees/NAME (every repo as a git worktree).
     #[command(subcommand)]
     Worktree(WorktreeCmd),
@@ -80,6 +91,98 @@ enum Cmd {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum LaunchctlCmd {
+    /// Load jobs from launchd .plist files, or (no files) the pullfile's `jobs`.
+    Load {
+        paths: Vec<PathBuf>,
+    },
+    /// Stop a job and forget it.
+    Unload {
+        label: String,
+    },
+    /// PID, last exit status and label of every job, like launchctl list.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Everything about one job: state, program, environment, foreground program.
+    Print {
+        label: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Start {
+        label: String,
+    },
+    Stop {
+        label: String,
+    },
+    /// Start a job; with -k, kill and restart it if it is running.
+    Kickstart {
+        label: String,
+        #[arg(short)]
+        k: bool,
+    },
+    /// Stop every job and the daemon.
+    Shutdown,
+}
+
+#[derive(Subcommand)]
+enum SessionCmd {
+    /// Start a session running CMD (default: your shell) and attach, unless -d.
+    New {
+        name: String,
+        /// Don't attach (like tmux new -d).
+        #[arg(short, long)]
+        detached: bool,
+        /// Working directory (default: the workspace root).
+        #[arg(short = 'c', long)]
+        cwd: Option<PathBuf>,
+        /// Restart the command whenever it exits (launchd KeepAlive).
+        #[arg(long)]
+        keep_alive: bool,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        cmd: Vec<String>,
+    },
+    /// Sessions with their running program and directory (tmux ls).
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Attach this terminal to a session; detach with ctrl-\.
+    Attach { name: String },
+    /// Type TEXT into a session (tmux send-keys).
+    Send {
+        name: String,
+        text: Vec<String>,
+        /// Press enter after the text.
+        #[arg(short, long)]
+        enter: bool,
+    },
+    /// Print a session's screen (tmux capture-pane).
+    Capture {
+        name: String,
+        /// Keep colours and attributes (ANSI escapes).
+        #[arg(short, long)]
+        escapes: bool,
+    },
+    /// For agents: type COMMAND + enter, wait until output settles, print the screen.
+    Run {
+        name: String,
+        /// Settle time with no new output, in ms.
+        #[arg(long, default_value_t = 800)]
+        idle: u64,
+        /// Give up waiting after this many ms.
+        #[arg(long, default_value_t = 60000)]
+        timeout: u64,
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    /// Stop and remove a session.
+    Kill { name: String },
 }
 
 #[derive(Subcommand)]
@@ -233,6 +336,12 @@ fn run(cli: Cli) -> Result<()> {
                 println!("org: {o}");
             }
         }
+        Cmd::Launchd => {
+            ensure_ignored(&root, "/.pull/")?;
+            launchd::daemon::run(&root)?
+        }
+        Cmd::Launchctl(cmd) => launchctl(&root, &pf, cmd)?,
+        Cmd::Session(cmd) => session(&root, cmd)?,
         Cmd::Worktree(WorktreeCmd::Add { name, branch }) => {
             ensure_ignored(&root, &format!("/{}/", worktree::DIR))?;
             let dest = worktree::add(&root, &pf, &name, branch.as_deref())?;
@@ -623,4 +732,202 @@ fn staged_repos(root: &Path, pf: &Pullfile) -> Result<Vec<String>> {
 fn workspace_env(root: &Path, pf: &Pullfile) -> Result<Vec<(String, String)>> {
     let local = Local::load(root).ok();
     env::resolve(root, pf, local.as_ref())
+}
+
+fn launchctl(root: &Path, pf: &Pullfile, cmd: LaunchctlCmd) -> Result<()> {
+    use launchd::{Request, Response, client};
+    match cmd {
+        LaunchctlCmd::Load { paths } => {
+            let jobs = if paths.is_empty() {
+                pf.jobs.clone()
+            } else {
+                paths
+                    .iter()
+                    .map(|p| launchd::Job::load_plist(p).with_context(|| p.display().to_string()))
+                    .collect::<Result<Vec<_>>>()?
+            };
+            let n = jobs.len();
+            client::request(root, &Request::Load { jobs, start: true })?;
+            println!("loaded {n} job(s)");
+        }
+        LaunchctlCmd::Unload { label } => {
+            client::request(root, &Request::Unload { label })?;
+        }
+        LaunchctlCmd::List { json } => {
+            let Response::Jobs(jobs) = client::request(root, &Request::List)? else {
+                bail!("unexpected reply");
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&jobs)?);
+            } else {
+                println!("PID\tStatus\tLabel");
+                for j in jobs {
+                    let pid = j.pid.map(|p| p.to_string()).unwrap_or("-".into());
+                    let status = j.last_exit.map(|c| c.to_string()).unwrap_or("-".into());
+                    println!("{pid}\t{status}\t{}", j.label);
+                }
+            }
+        }
+        LaunchctlCmd::Print { label, json } => {
+            let Response::Job(j) = client::request(root, &Request::Print { label })? else {
+                bail!("unexpected reply");
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&j)?);
+            } else {
+                println!("{} = {{", j.label);
+                println!("\tstate = {}", j.state);
+                println!(
+                    "\tpid = {}",
+                    j.pid.map(|p| p.to_string()).unwrap_or("-".into())
+                );
+                println!("\truns = {}", j.runs);
+                println!(
+                    "\tlast exit code = {}",
+                    j.last_exit.map(|c| c.to_string()).unwrap_or("-".into())
+                );
+                println!("\tprogram = {}", j.argv.join(" "));
+                println!("\tworking directory = {}", j.cwd);
+                if let Some(fg) = &j.foreground {
+                    println!(
+                        "\tforeground = {fg} in {}",
+                        j.foreground_cwd.as_deref().unwrap_or("?")
+                    );
+                }
+                println!("\tattached = {}", j.attached);
+                for (k, v) in &j.job.environment_variables {
+                    println!("\tenv {k} = {v}");
+                }
+                println!("}}");
+            }
+        }
+        LaunchctlCmd::Start { label } => {
+            client::request(root, &Request::Start { label })?;
+        }
+        LaunchctlCmd::Stop { label } => {
+            client::request(root, &Request::Stop { label })?;
+        }
+        LaunchctlCmd::Kickstart { label, k } => {
+            client::request(root, &Request::Kickstart { label, kill: k })?;
+        }
+        LaunchctlCmd::Shutdown => {
+            if client::running(root) {
+                client::request(root, &Request::Shutdown)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn session(root: &Path, cmd: SessionCmd) -> Result<()> {
+    use launchd::{KeepAlive, Request, Response, client};
+    match cmd {
+        SessionCmd::New {
+            name,
+            detached,
+            cwd,
+            keep_alive,
+            cmd,
+        } => {
+            let cwd = match cwd {
+                Some(c) => Some(absolutize(&std::env::current_dir()?.join(c))?),
+                None => std::env::current_dir().ok(),
+            };
+            let job = launchd::Job {
+                label: name.clone(),
+                program_arguments: cmd,
+                working_directory: cwd.map(|c| c.display().to_string()),
+                run_at_load: true,
+                keep_alive: keep_alive.then_some(KeepAlive::Always(true)),
+                throttle_interval: keep_alive.then_some(1),
+                ..Default::default()
+            };
+            client::request(
+                root,
+                &Request::Load {
+                    jobs: vec![job],
+                    start: true,
+                },
+            )?;
+            if detached {
+                println!("{name}");
+            } else {
+                client::attach(root, &name)?;
+            }
+        }
+        SessionCmd::Ls { json } => {
+            let Response::Jobs(jobs) = client::request(root, &Request::List)? else {
+                bail!("unexpected reply");
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&jobs)?);
+            } else {
+                for j in jobs {
+                    let what = match (&j.foreground, &j.foreground_cwd) {
+                        (Some(fg), Some(cwd)) => format!("{fg} in {cwd}"),
+                        _ => j.state.clone(),
+                    };
+                    let attached = if j.attached > 0 { " (attached)" } else { "" };
+                    println!("{}: {what}{attached}", j.label);
+                }
+            }
+        }
+        SessionCmd::Attach { name } => client::attach(root, &name)?,
+        SessionCmd::Send { name, text, enter } => {
+            let mut data = text.join(" ");
+            if enter {
+                data.push('\r');
+            }
+            client::request(root, &Request::Send { label: name, data })?;
+        }
+        SessionCmd::Capture { name, escapes } => {
+            if let Response::Text(t) = client::request(
+                root,
+                &Request::Capture {
+                    label: name,
+                    escapes,
+                },
+            )? {
+                println!("{t}");
+            }
+        }
+        SessionCmd::Run {
+            name,
+            idle,
+            timeout,
+            command,
+        } => {
+            let data = format!("{}\r", command.join(" "));
+            client::request(
+                root,
+                &Request::Send {
+                    label: name.clone(),
+                    data,
+                },
+            )?;
+            // Let the command start producing output before waiting for it to settle.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            client::request(
+                root,
+                &Request::WaitIdle {
+                    label: name.clone(),
+                    idle_ms: idle,
+                    timeout_ms: timeout,
+                },
+            )?;
+            if let Response::Text(t) = client::request(
+                root,
+                &Request::Capture {
+                    label: name,
+                    escapes: false,
+                },
+            )? {
+                println!("{t}");
+            }
+        }
+        SessionCmd::Kill { name } => {
+            client::request(root, &Request::Unload { label: name })?;
+        }
+    }
+    Ok(())
 }

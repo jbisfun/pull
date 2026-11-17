@@ -44,3 +44,37 @@ With the default `email = none`, commits are written as `name <>`, so no email g
 
 If the root is itself a git repo, `pull commit` also commits the updated pullfile.plist
 there with the same message.
+
+## Jobs and sessions (launchd)
+
+pull ports launchd's job model (Apple's launchd, `liblaunch/launch.h`) to the workspace.
+Jobs use launchd plist keys, either in the pullfile's `jobs` array or in standalone
+`.plist` files:
+
+    Label, Program, ProgramArguments, EnvironmentVariables, WorkingDirectory, RunAtLoad,
+    KeepAlive (bool or {SuccessfulExit}), StartInterval, ThrottleInterval,
+    StandardOutPath, Disabled, LaunchOnlyOnce
+
+A per-workspace daemon (`pull launchd`, started automatically, socket `.pull/launchd.sock`)
+supervises them. Every job runs in a pseudo-terminal with the workspace env (`pull env`)
+plus its own EnvironmentVariables and `PULL_JOB`, so every job is also a session.
+
+    pull launchctl load [FILE.plist...]   load pullfile jobs, or launchd plists
+    pull launchctl list | print LABEL     (--json for agents)
+    pull launchctl start|stop|unload LABEL
+    pull launchctl kickstart [-k] LABEL   start, or kill and restart
+    pull launchctl shutdown               stop all jobs and the daemon
+
+tmux-style sessions, for humans and agents:
+
+    pull session new NAME [-d] [-c DIR] [--keep-alive] [CMD...]   default CMD: $SHELL
+    pull session attach NAME              detach with ctrl-\
+    pull session ls [--json]              running program + its directory per session
+    pull session send NAME [-e] TEXT      type into it (-e: press enter)
+    pull session capture NAME [-e]        print its screen (-e: keep colours)
+    pull session run NAME CMD...          agents: type CMD, wait for output to settle,
+                                          print the screen
+    pull session kill NAME
+
+StandardErrorPath is accepted, but a terminal merges stderr into stdout, so both go to
+StandardOutPath.
