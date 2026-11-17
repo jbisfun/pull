@@ -233,6 +233,7 @@ fn run(cli: Cli) -> Result<()> {
     }
     let root = config::find_root(&cwd)?;
     let mut pf = Pullfile::load(&root)?;
+    apply_ignores(&root, &pf);
 
     match cli.cmd {
         Cmd::Init { .. } => unreachable!(),
@@ -477,6 +478,54 @@ fn ensure_ignored(root: &Path, line: &str) -> Result<()> {
     s.push_str(line);
     s.push('\n');
     std::fs::write(p, s)?;
+    Ok(())
+}
+
+const IGNORE_BEGIN: &str = "# >>> pull ignore (pullfile.plist)";
+const IGNORE_END: &str = "# <<< pull ignore";
+
+/// Write the pullfile's `ignore` patterns into every cloned repo's .git/info/exclude,
+/// between markers, leaving the rest of the file alone. Runs on every command.
+fn apply_ignores(root: &Path, pf: &Pullfile) {
+    for r in &pf.repos {
+        let Ok(repo) = Repository::open(root.join(&r.name)) else {
+            continue;
+        };
+        if let Err(e) = write_exclude(&repo.commondir().join("info/exclude"), &pf.ignore) {
+            eprintln!("{}: ignore: {e:#}", r.name);
+        }
+    }
+}
+
+fn write_exclude(path: &Path, patterns: &[String]) -> Result<()> {
+    let cur = std::fs::read_to_string(path).unwrap_or_default();
+    let mut out = String::new();
+    let mut inside = false;
+    for line in cur.lines() {
+        match line {
+            IGNORE_BEGIN => inside = true,
+            IGNORE_END => inside = false,
+            _ if !inside => {
+                out.push_str(line);
+                out.push('\n');
+            }
+            _ => {}
+        }
+    }
+    if !patterns.is_empty() {
+        out.push_str(IGNORE_BEGIN);
+        out.push('\n');
+        for p in patterns {
+            out.push_str(p);
+            out.push('\n');
+        }
+        out.push_str(IGNORE_END);
+        out.push('\n');
+    }
+    if out != cur {
+        std::fs::create_dir_all(path.parent().context("exclude path")?)?;
+        std::fs::write(path, out)?;
+    }
     Ok(())
 }
 

@@ -45,6 +45,14 @@ With the default `email = none`, commits are written as `name <>`, so no email g
 If the root is itself a git repo, `pull commit` also commits the updated pullfile.plist
 there with the same message.
 
+## Ignore
+
+The pullfile's `ignore` array holds gitignore patterns for every repo, e.g.
+`__pycache__/`, `*.pyc`, `.DS_Store`. pull keeps them in each repo's `.git/info/exclude`
+(between `# >>> pull ignore` markers) on every command, so repos don't need their own
+.gitignore entries and nothing is committed for it. Patterns don't untrack files that are
+already committed; `git rm --cached` those.
+
 ## Jobs and sessions (launchd)
 
 pull ports launchd's job model (Apple's launchd, `liblaunch/launch.h`) to the workspace.

@@ -17,6 +17,9 @@ pub struct Pullfile {
     pub env: Env,
     pub lint: Lint,
     pub hooks: Hooks,
+    /// gitignore patterns applied to every repo (kept in each repo's .git/info/exclude).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ignore: Vec<String>,
     pub repos: Vec<Repo>,
     /// launchd jobs for this workspace (launchd plist keys), run by `pull launchd`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
