@@ -105,7 +105,7 @@ already committed; `git rm --cached` those.
 
 Register it with an agent, e.g. Hermes:
 
-    hermes mcp add pull --command pull --args mcp --root ~/jbisfun
+    hermes mcp add pull --command pull --args mcp --root /path/to/workspace
 
 ## Jobs and sessions (launchd)
 
