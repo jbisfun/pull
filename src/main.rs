@@ -3,6 +3,7 @@ mod env;
 mod git;
 mod hooks;
 mod lint;
+mod worktree;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -71,10 +72,31 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
     },
+    /// Workspace worktrees under .worktrees/NAME (every repo as a git worktree).
+    #[command(subcommand)]
+    Worktree(WorktreeCmd),
     /// Run a command in every cloned repo (e.g. `pull each git log -1`).
     Each {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorktreeCmd {
+    /// Create .worktrees/NAME: each repo checked out on BRANCH (default NAME).
+    Add {
+        name: String,
+        #[arg(short, long)]
+        branch: Option<String>,
+    },
+    /// List workspace worktrees.
+    List,
+    /// Remove a workspace worktree (branches are kept).
+    Rm {
+        name: String,
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -210,6 +232,22 @@ fn run(cli: Cli) -> Result<()> {
             if let Some(o) = &pf.identity.org {
                 println!("org: {o}");
             }
+        }
+        Cmd::Worktree(WorktreeCmd::Add { name, branch }) => {
+            ensure_ignored(&root, &format!("/{}/", worktree::DIR))?;
+            let dest = worktree::add(&root, &pf, &name, branch.as_deref())?;
+            println!("workspace: {}", dest.display());
+        }
+        Cmd::Worktree(WorktreeCmd::List) => {
+            for (name, path) in worktree::list(&root)? {
+                let wpf = Pullfile::load(&path)?;
+                let mut branches: Vec<_> = wpf.repos.iter().map(|r| r.branch.as_str()).collect();
+                branches.dedup();
+                println!("{name:<20} {:<12} {}", branches.join(","), path.display());
+            }
+        }
+        Cmd::Worktree(WorktreeCmd::Rm { name, force }) => {
+            worktree::remove(&root, &pf, &name, force)?
         }
         Cmd::Env { envrc } => {
             if envrc {
