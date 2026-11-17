@@ -1,20 +1,39 @@
 //! The workspace environment: pullfile `env`, then local.toml `[env]` on top.
 
-use crate::config::{Env, Local, Pullfile};
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-/// Resolved variables to export, in order. `PATH` is complete (new entries + current PATH).
-pub fn resolve(root: &Path, pf: &Pullfile, local: Option<&Local>) -> Result<Vec<(String, String)>> {
-    let layers: Vec<&Env> = std::iter::once(&pf.env)
-        .chain(local.map(|l| &l.env))
-        .collect();
+/// Section key, in the pullfile and in local.toml.
+pub const SECTION: &str = "env";
 
+/// Environment for the workspace. Values expand `~`, `$VAR` and `${VAR}` (including
+/// `$PULL_ROOT`); relative PATH entries are relative to the pullfile root.
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+#[serde(default)]
+pub struct Env {
+    /// Prepended to PATH, first entry wins.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub path: Vec<String>,
+    /// Exported variables (toolchain selection, etc.).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub vars: BTreeMap<String, String>,
+}
+
+impl Env {
+    pub fn is_empty(&self) -> bool {
+        self.path.is_empty() && self.vars.is_empty()
+    }
+}
+
+/// Resolved variables to export, in order. `layers` go from shared to most specific
+/// (pullfile, then local.toml). `PATH` is complete (new entries + current PATH).
+pub fn resolve(root: &Path, layers: &[&Env]) -> Result<Vec<(String, String)>> {
     let mut vars: BTreeMap<String, String> = BTreeMap::new();
     vars.insert("PULL_ROOT".into(), root.display().to_string());
-    for env in &layers {
+    for env in layers {
         for (k, v) in &env.vars {
             let value = expand(v, &vars);
             vars.insert(k.clone(), value);
@@ -73,20 +92,17 @@ mod tests {
 
     #[test]
     fn layers_expand_and_path() {
-        let mut pf = Pullfile::default();
-        pf.env
+        let mut shared = Env::default();
+        shared
             .vars
             .insert("TOOLS".into(), "$PULL_ROOT/tools".into());
-        pf.env.vars.insert("GOTOOLCHAIN".into(), "local".into());
-        pf.env.path = vec!["bin".into(), "$TOOLS".into(), "~/x".into()];
-        let mut local = Local::default();
-        local
-            .env
-            .vars
-            .insert("GOTOOLCHAIN".into(), "go1.27.4".into());
-        local.env.path = vec!["/opt/mine".into()];
+        shared.vars.insert("GOTOOLCHAIN".into(), "local".into());
+        shared.path = vec!["bin".into(), "$TOOLS".into(), "~/x".into()];
+        let mut local = Env::default();
+        local.vars.insert("GOTOOLCHAIN".into(), "go1.27.4".into());
+        local.path = vec!["/opt/mine".into()];
         let root = Path::new("/w");
-        let v: BTreeMap<_, _> = resolve(root, &pf, Some(&local))
+        let v: BTreeMap<_, _> = resolve(root, &[&shared, &local])
             .unwrap()
             .into_iter()
             .collect();

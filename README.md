@@ -5,14 +5,49 @@ commits. Each repo is cloned to `{pullfile-root}/{repo-name}`. A single `pull co
 one commit, with the same message, identity and signature, to every repo that has changes,
 then records the new pins.
 
+## Crates and features
+
+pull is a cargo workspace. The core is always built; everything else is an optional
+crate behind a cargo feature of the `pull` binary, and no feature requires another:
+
+    crate          feature        what
+    pull-core      (always)       pullfile.plist / local.toml model, identity, path routing
+    pull-git       (always)       clone/sync, status, stage, commit across repos, push
+                   https, ssh     git transports (git2 features)
+    pull-env       env            pullfile `env` + local.toml `[env]`; pull env / pull shell
+    pull-hooks     hooks          pullfile `hooks` (precommit, postcommit, pull)
+    pull-lint      lint           pullfile `lint`; pull lint
+                   conventional   lint `conventional` (Conventional Commits parser)
+    pull-ignore    ignore         pullfile `ignore` -> each repo's .git/info/exclude
+    pull-worktree  worktree       pull worktree
+    pull-launchd   launchd        pullfile `jobs`; pull launchctl / pull session
+    pull-mcp       mcp            pull mcp (session/job tools only with `launchd`)
+
+All features are on by default. Build a smaller pull with e.g.
+
+    cargo install --path . --no-default-features --features https,env,hooks
+
+Features meet only in the binary (`src/workspace.rs`): without `env`, hooks, jobs, `each`
+and MCP `exec` get just PULL_ROOT; without `hooks` or `lint`, commits skip them; without
+`launchd`, the MCP server has no session tools. Only `identity` and `repos` are core
+pullfile keys: every other top-level key is a section owned by its feature crate, kept
+verbatim (and reported as ignored) when that feature isn't built, so a lean build never
+drops another build's settings. `pull --version` and `pull status --json` (`features`)
+list what a binary was built with.
+
 ## Files
 
 `pullfile.plist` (shared, committed):
 
     identity: org (selects [orgs.<org>] in local.toml), email = none|local, require_signing
-    lint:     no_description, max_subject_length, conventional, no_trailing_period
-    hooks:    precommit, postcommit, pull   (arrays of `sh -c` commands, run in the root)
     repos:    [{name, upstream, branch, commit}]
+    env:      path, vars                    (feature env)
+    lint:     no_description, max_subject_length, conventional, no_trailing_period
+                                            (feature lint)
+    hooks:    precommit, postcommit, pull   (feature hooks; arrays of `sh -c` commands,
+                                            run in the root)
+    ignore:   [patterns]                    (feature ignore)
+    jobs:     [launchd jobs]                (feature launchd)
 
 Hook env: PULL_ROOT, PULL_HOOK, PULL_REPOS (space-separated), PULL_MESSAGE (commit hooks).
 
@@ -36,8 +71,8 @@ With the default `email = none`, commits are written as `name <>`, so no email g
     pull repo add URL [--name] [--branch]   |  repo rm NAME  |  repo list
     pull sync                      clone missing repos, fetch, fast-forward to the pins
     pull update                    fast-forward to upstream branches and re-pin
-    pull status [--json]           --json: root, lint rules, per-repo branch/head/pin,
-                                   ahead/behind and changed files (for tools)
+    pull status [--json]           --json: root, features, lint rules, per-repo
+                                   branch/head/pin, ahead/behind and changed files
     pull add PATHS...              each path is staged in the repo that contains it
     pull unstage PATHS...          back to HEAD, routed the same way
     pull commit -m MSG [-a] [PATHS...] [--no-verify]

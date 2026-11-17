@@ -1304,29 +1304,122 @@ name = "pull"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "auth-git2",
  "clap",
- "crossterm",
+ "git2",
+ "pull-core",
+ "pull-env",
+ "pull-git",
+ "pull-hooks",
+ "pull-ignore",
+ "pull-launchd",
+ "pull-lint",
+ "pull-mcp",
+ "pull-worktree",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
+name = "pull-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
  "dirs 7.0.0",
+ "plist",
+ "serde",
+ "toml",
+]
+
+[[package]]
+name = "pull-env"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs 7.0.0",
+ "serde",
+ "shellexpand",
+ "shlex",
+]
+
+[[package]]
+name = "pull-git"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "auth-git2",
+ "git2",
+ "pull-core",
+ "serde",
+]
+
+[[package]]
+name = "pull-hooks"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+]
+
+[[package]]
+name = "pull-ignore"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "git2",
+]
+
+[[package]]
+name = "pull-launchd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crossterm",
+ "nix 0.32.0",
+ "plist",
+ "portable-pty",
+ "serde",
+ "serde_json",
+ "shellexpand",
+ "vt100",
+]
+
+[[package]]
+name = "pull-lint"
+version = "0.1.0"
+dependencies = [
  "git-conventional",
+ "serde",
+]
+
+[[package]]
+name = "pull-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
  "git2",
  "grep-matcher",
  "grep-regex",
  "grep-searcher",
  "ignore",
  "jiff",
- "nix 0.32.0",
  "plist",
- "portable-pty",
+ "pull-core",
+ "pull-git",
+ "pull-launchd",
  "rmcp",
  "schemars",
  "serde",
- "serde_json",
- "shellexpand",
- "shlex",
  "tokio",
- "toml",
- "vt100",
+]
+
+[[package]]
+name = "pull-worktree"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "git2",
+ "pull-core",
+ "pull-git",
 ]
 
 [[package]]

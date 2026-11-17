@@ -1,0 +1,27 @@
+[package]
+name = "pull-mcp"
+version = "0.1.0"
+edition = "2024"
+description = "MCP server over a pull workspace"
+
+[features]
+default = ["sessions"]
+# session_* and job tools (needs the launchd daemon).
+sessions = ["dep:pull-launchd"]
+
+[dependencies]
+anyhow.workspace = true
+git2.workspace = true
+grep-matcher = "0.1.9"
+grep-regex = "0.1.14"
+grep-searcher = "0.1.17"
+ignore = "0.4.34"
+jiff = "1.0.0"
+plist.workspace = true
+pull-core = { path = "../pull-core" }
+pull-git = { path = "../pull-git", default-features = false }
+pull-launchd = { path = "../pull-launchd", optional = true }
+rmcp = { version = "3.10.0", features = ["server", "transport-io", "macros"] }
+schemars = "1.2.3"
+serde.workspace = true
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "io-std", "process", "time"] }

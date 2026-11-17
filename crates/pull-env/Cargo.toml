@@ -1,0 +1,12 @@
+[package]
+name = "pull-env"
+version = "0.1.0"
+edition = "2024"
+description = "Layered workspace environment (pullfile `env`, local.toml `[env]`)"
+
+[dependencies]
+anyhow.workspace = true
+dirs = "7.0.0"
+serde.workspace = true
+shellexpand.workspace = true
+shlex = "2.0.1"

@@ -2,10 +2,10 @@
 //! pull workspace whose repos are git worktrees of the main ones on branch NAME.
 //! Run any pull command inside it (it has its own pullfile.plist with the new branch).
 
-use crate::config::{LOCAL, PULLFILE, Pullfile};
-use crate::git;
 use anyhow::{Context, Result, bail};
 use git2::{BranchType, Repository, WorktreeAddOptions, WorktreePruneOptions};
+use pull_core::{LOCAL, PULLFILE, Pullfile};
+use pull_git::git;
 use std::path::{Path, PathBuf};
 
 pub const DIR: &str = ".worktrees";

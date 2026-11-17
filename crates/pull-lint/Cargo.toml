@@ -1,0 +1,13 @@
+[package]
+name = "pull-lint"
+version = "0.1.0"
+edition = "2024"
+description = "Commit message rules (pullfile `lint`)"
+
+[features]
+default = ["conventional"]
+conventional = ["dep:git-conventional"]
+
+[dependencies]
+git-conventional = { version = "1.1.0", optional = true }
+serde.workspace = true

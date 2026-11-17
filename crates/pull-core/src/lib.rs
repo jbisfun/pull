@@ -1,6 +1,15 @@
-//! pullfile.plist (shared, committed) and local.toml (per-machine, ignored).
+//! The pull workspace model: pullfile.plist (shared, committed), local.toml (per-machine,
+//! ignored), commit identity, and routing user paths to repos.
+//!
+//! Only `identity` and `repos` belong to the core. Every other top-level key is a
+//! *section* owned by an optional feature crate (`env`, `lint`, `hooks`, `ignore`,
+//! `jobs`, ...): it is kept as raw plist and parsed by its owner with
+//! [`Pullfile::section`], so a pull built without that feature still round-trips it.
+
+pub mod paths;
 
 use anyhow::{Context, Result, bail};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -12,18 +21,11 @@ pub const LOCAL: &str = "local.toml";
 #[serde(default)]
 pub struct Pullfile {
     pub identity: IdentityPolicy,
-    /// Shared environment, like an .envrc for the whole workspace.
-    #[serde(skip_serializing_if = "Env::is_empty")]
-    pub env: Env,
-    pub lint: Lint,
-    pub hooks: Hooks,
-    /// gitignore patterns applied to every repo (kept in each repo's .git/info/exclude).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub ignore: Vec<String>,
+    /// Feature sections (`env`, `lint`, `hooks`, `ignore`, `jobs`, ...), in file order.
+    /// Written between `identity` and `repos`.
+    #[serde(flatten)]
+    pub sections: plist::Dictionary,
     pub repos: Vec<Repo>,
-    /// launchd jobs for this workspace (launchd plist keys), run by `pull launchd`.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub jobs: Vec<crate::launchd::Job>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -62,45 +64,6 @@ pub struct IdentityPolicy {
     pub require_signing: bool,
 }
 
-#[derive(Serialize, Deserialize, Debug, Default, Clone)]
-#[serde(default)]
-pub struct Lint {
-    /// Subject line only; no body.
-    pub no_description: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_subject_length: Option<u64>,
-    /// Must parse as a Conventional Commit.
-    pub conventional: bool,
-    pub no_trailing_period: bool,
-}
-
-/// Environment for the workspace. Values expand `~`, `$VAR` and `${VAR}` (including
-/// `$PULL_ROOT`); relative PATH entries are relative to the pullfile root.
-#[derive(Serialize, Deserialize, Debug, Default, Clone)]
-#[serde(default)]
-pub struct Env {
-    /// Prepended to PATH, first entry wins.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub path: Vec<String>,
-    /// Exported variables (toolchain selection, etc.).
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub vars: BTreeMap<String, String>,
-}
-
-impl Env {
-    pub fn is_empty(&self) -> bool {
-        self.path.is_empty() && self.vars.is_empty()
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, Default, Clone)]
-#[serde(default)]
-pub struct Hooks {
-    pub precommit: Vec<String>,
-    pub postcommit: Vec<String>,
-    pub pull: Vec<String>,
-}
-
 impl Pullfile {
     pub fn load(root: &Path) -> Result<Self> {
         let p = root.join(PULLFILE);
@@ -114,6 +77,29 @@ impl Pullfile {
 
     pub fn repo_mut(&mut self, name: &str) -> Option<&mut Repo> {
         self.repos.iter_mut().find(|r| r.name == name)
+    }
+
+    pub fn repo_names(&self) -> Vec<String> {
+        self.repos.iter().map(|r| r.name.clone()).collect()
+    }
+
+    pub fn has_section(&self, key: &str) -> bool {
+        self.sections.contains_key(key)
+    }
+
+    /// Parse the section `key` (its `Default` when absent).
+    pub fn section<T: DeserializeOwned + Default>(&self, key: &str) -> Result<T> {
+        match self.sections.get(key) {
+            None => Ok(T::default()),
+            Some(v) => plist::from_value(v).with_context(|| format!("{PULLFILE}: `{key}`")),
+        }
+    }
+
+    /// Replace the section `key`.
+    pub fn set_section<T: Serialize>(&mut self, key: &str, value: &T) -> Result<()> {
+        let v = plist::to_value(value).with_context(|| format!("{PULLFILE}: `{key}`"))?;
+        self.sections.insert(key.to_string(), v);
+        Ok(())
     }
 }
 
@@ -132,9 +118,9 @@ pub struct Local {
     pub gpg_program: Option<String>,
     #[serde(default)]
     pub orgs: BTreeMap<String, OrgIdentity>,
-    /// Machine-specific env layered over the pullfile's (`[env]` with `path`/`vars`).
-    #[serde(default, skip_serializing_if = "Env::is_empty")]
-    pub env: Env,
+    /// Feature sections, e.g. `[env]` (machine-specific env over the pullfile's).
+    #[serde(flatten)]
+    pub sections: toml::Table,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
@@ -165,6 +151,17 @@ impl Local {
         };
         let s = std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
         toml::from_str(&s).with_context(|| format!("parsing {}", p.display()))
+    }
+
+    /// Parse the table `key` (its `Default` when absent).
+    pub fn section<T: DeserializeOwned + Default>(&self, key: &str) -> Result<T> {
+        match self.sections.get(key) {
+            None => Ok(T::default()),
+            Some(v) => v
+                .clone()
+                .try_into()
+                .with_context(|| format!("{LOCAL}: `[{key}]`")),
+        }
     }
 }
 
@@ -224,5 +221,55 @@ pub fn find_root(start: &Path) -> Result<PathBuf> {
                 start.display()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_sections_round_trip() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>identity</key><dict><key>email</key><string>none</string></dict>
+  <key>lint</key><dict><key>max_subject_length</key><integer>40</integer></dict>
+  <key>repos</key><array><dict><key>name</key><string>a</string><key>upstream</key><string>u</string></dict></array>
+  <key>jobs</key><array><dict><key>Label</key><string>x</string><key>RunAtLoad</key><true/></dict></array>
+</dict></plist>"#;
+        let pf: Pullfile = plist::from_bytes(xml.as_bytes()).unwrap();
+        assert_eq!(pf.repos[0].branch, "main");
+        assert_eq!(pf.sections.keys().collect::<Vec<_>>(), ["lint", "jobs"]);
+
+        #[derive(Deserialize, Default)]
+        struct Lint {
+            max_subject_length: Option<u64>,
+        }
+        assert_eq!(
+            pf.section::<Lint>("lint").unwrap().max_subject_length,
+            Some(40)
+        );
+        assert!(
+            pf.section::<Lint>("nope")
+                .unwrap()
+                .max_subject_length
+                .is_none()
+        );
+
+        let mut out = Vec::new();
+        plist::to_writer_xml(&mut out, &pf).unwrap();
+        let back: Pullfile = plist::from_bytes(&out).unwrap();
+        assert_eq!(back.sections, pf.sections);
+    }
+
+    #[test]
+    fn local_sections() {
+        let l: Local = toml::from_str("name = \"jp\"\n[env]\npath = [\"/x\"]\n").unwrap();
+        #[derive(Deserialize, Default)]
+        struct Env {
+            path: Vec<String>,
+        }
+        assert_eq!(l.section::<Env>("env").unwrap().path, ["/x"]);
+        assert!(toml::to_string(&l).unwrap().contains("[env]"));
     }
 }

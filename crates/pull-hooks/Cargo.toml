@@ -1,0 +1,9 @@
+[package]
+name = "pull-hooks"
+version = "0.1.0"
+edition = "2024"
+description = "pullfile `hooks`: precommit, postcommit, pull"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true

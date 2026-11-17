@@ -1,0 +1,17 @@
+[package]
+name = "pull-git"
+version = "0.1.0"
+edition = "2024"
+description = "git2 repository operations across a pull workspace"
+
+[features]
+default = ["https", "ssh"]
+https = ["git2/https"]
+ssh = ["git2/ssh"]
+
+[dependencies]
+anyhow.workspace = true
+auth-git2 = "0.6.0"
+git2.workspace = true
+pull-core = { path = "../pull-core" }
+serde.workspace = true

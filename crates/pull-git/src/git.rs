@@ -1,11 +1,11 @@
 //! Repository operations on top of git2 (libgit2) + auth-git2.
 
-use crate::config::Identity;
 use anyhow::{Context, Result, bail};
 use auth_git2::GitAuthenticator;
 use git2::{
     BranchType, IndexAddOption, ObjectType, Oid, Repository, ResetType, Signature, StatusOptions,
 };
+use pull_core::Identity;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};

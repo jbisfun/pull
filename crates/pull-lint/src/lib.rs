@@ -1,4 +1,21 @@
-use crate::config::Lint;
+//! Commit message rules: the pullfile `lint` section.
+
+use serde::{Deserialize, Serialize};
+
+/// Pullfile section key.
+pub const SECTION: &str = "lint";
+
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+#[serde(default)]
+pub struct Lint {
+    /// Subject line only; no body.
+    pub no_description: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_subject_length: Option<u64>,
+    /// Must parse as a Conventional Commit (needs the `conventional` feature).
+    pub conventional: bool,
+    pub no_trailing_period: bool,
+}
 
 /// Returns a list of violations (empty = ok). `msg` should already be prettified.
 pub fn check(rules: &Lint, msg: &str) -> Vec<String> {
@@ -23,10 +40,13 @@ pub fn check(rules: &Lint, msg: &str) -> Vec<String> {
     if rules.no_trailing_period && subject.ends_with('.') {
         out.push("no_trailing_period: subject ends with '.'".into());
     }
-    if rules.conventional
-        && let Err(e) = git_conventional::Commit::parse(msg)
-    {
-        out.push(format!("conventional: {e}"));
+    if rules.conventional {
+        #[cfg(feature = "conventional")]
+        if let Err(e) = git_conventional::Commit::parse(msg) {
+            out.push(format!("conventional: {e}"));
+        }
+        #[cfg(not(feature = "conventional"))]
+        out.push("conventional: pull was built without the `conventional` feature".into());
     }
     out
 }
@@ -35,6 +55,7 @@ pub fn check(rules: &Lint, msg: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "conventional")]
     #[test]
     fn rules() {
         let r = Lint {

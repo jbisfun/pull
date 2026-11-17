@@ -11,6 +11,9 @@
 //! ThrottleInterval, StandardOutPath, Disabled, LaunchOnlyOnce. A PTY merges stdout and
 //! stderr, so StandardErrorPath is accepted but the combined output goes to StandardOutPath.
 
+/// Pullfile section key (an array of jobs).
+pub const SECTION: &str = "jobs";
+
 pub mod client;
 pub mod daemon;
 pub mod procinfo;

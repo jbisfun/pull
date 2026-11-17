@@ -1,6 +1,20 @@
+//! The pullfile `hooks` section: shell commands run around commits and syncs.
+
 use anyhow::{Result, bail};
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Command;
+
+/// Pullfile section key.
+pub const SECTION: &str = "hooks";
+
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+#[serde(default)]
+pub struct Hooks {
+    pub precommit: Vec<String>,
+    pub postcommit: Vec<String>,
+    pub pull: Vec<String>,
+}
 
 /// Run each hook command through `sh -c` in the pullfile root.
 /// Env: the workspace env (`pull env`), PULL_ROOT, PULL_HOOK, PULL_REPOS

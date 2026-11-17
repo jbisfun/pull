@@ -97,8 +97,13 @@ impl Entry {
     }
 }
 
+/// Supplies the workspace environment for each job start (resolved at each start, so
+/// edits to the pullfile `env` apply to the next run).
+pub type EnvProvider = Box<dyn Fn() -> Vec<(String, String)> + Send + Sync>;
+
 pub struct Daemon {
     root: PathBuf,
+    env: EnvProvider,
     jobs: Mutex<BTreeMap<String, Entry>>,
     ids: AtomicU64,
 }
@@ -113,15 +118,6 @@ fn job_cwd(root: &Path, job: &Job) -> PathBuf {
         .as_deref()
         .map(|d| expand(root, d))
         .unwrap_or_else(|| root.to_path_buf())
-}
-
-/// The workspace env (pullfile `env` + local.toml), resolved at each start.
-fn workspace_env(root: &Path) -> Vec<(String, String)> {
-    let Ok(pf) = crate::config::Pullfile::load(root) else {
-        return Vec::new();
-    };
-    let local = crate::config::Local::load(root).ok();
-    crate::env::resolve(root, &pf, local.as_ref()).unwrap_or_default()
 }
 
 impl Daemon {
@@ -162,7 +158,7 @@ impl Daemon {
         cmd.args(&argv[1..]);
         cmd.cwd(job_cwd(&self.root, &job));
         cmd.env("TERM", "xterm-256color");
-        for (k, v) in workspace_env(&self.root) {
+        for (k, v) in (self.env)() {
             cmd.env(k, v);
         }
         for (k, v) in &job.environment_variables {
@@ -588,8 +584,9 @@ impl Daemon {
     }
 }
 
-/// Run the daemon for the workspace at `root` (foreground).
-pub fn run(root: &Path) -> Result<()> {
+/// Run the daemon for the workspace at `root` (foreground), loading `jobs` (the pullfile's)
+/// at start. `env` gives every job its base environment.
+pub fn run(root: &Path, jobs: Vec<Job>, env: EnvProvider) -> Result<()> {
     std::fs::create_dir_all(state_dir(root))?;
     let sock = socket_path(root);
     if UnixStream::connect(&sock).is_ok() {
@@ -600,14 +597,15 @@ pub fn run(root: &Path) -> Result<()> {
         UnixListener::bind(&sock).with_context(|| format!("binding {}", sock.display()))?;
     let daemon = Arc::new(Daemon {
         root: root.to_path_buf(),
+        env,
         jobs: Mutex::default(),
         ids: AtomicU64::new(1),
     });
-    let pf = crate::config::Pullfile::load(root)?;
-    if let Err(e) = daemon.load(pf.jobs.clone(), true) {
+    let n = jobs.len();
+    if let Err(e) = daemon.load(jobs, true) {
         eprintln!("launchd: loading pullfile jobs: {e:#}");
     }
-    eprintln!("launchd: {} ({} jobs)", sock.display(), pf.jobs.len());
+    eprintln!("launchd: {} ({n} jobs)", sock.display());
     std::thread::spawn({
         let d = daemon.clone();
         move || d.supervise()
