@@ -152,7 +152,7 @@ fn run(cli: Cli) -> Result<()> {
                 commit: None,
             });
             pf.save(&root)?;
-            ensure_ignored(&root, &format!("/{name}/"))?;
+            exclude_from_root_repo(&root, &name)?;
             println!("added {name}; run `pull sync` to clone");
         }
         Cmd::Repo(RepoCmd::Rm { name }) => {
@@ -329,6 +329,30 @@ fn repo_name_from_url(url: &str) -> Result<String> {
         bail!("can't derive a name from `{url}`; pass --name");
     }
     Ok(last.to_string())
+}
+
+/// Keep a repo dir out of the root repo's `git status`, if the root is a git repo.
+/// Uses `.git/info/exclude`, not `.gitignore`: editors (Zed/ycode) honour `.gitignore`
+/// outside of git too and would stop scanning the repo, hiding it from the git panel.
+fn exclude_from_root_repo(root: &Path, name: &str) -> Result<()> {
+    let Some(repo) = root_repo(root) else {
+        return Ok(());
+    };
+    let info = repo.path().join("info");
+    std::fs::create_dir_all(&info)?;
+    let p = info.join("exclude");
+    let line = format!("/{name}/");
+    let cur = std::fs::read_to_string(&p).unwrap_or_default();
+    if cur.lines().any(|l| l.trim() == line) {
+        return Ok(());
+    }
+    let sep = if cur.is_empty() || cur.ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
+    std::fs::write(&p, format!("{cur}{sep}{line}\n"))?;
+    Ok(())
 }
 
 fn ensure_ignored(root: &Path, line: &str) -> Result<()> {
