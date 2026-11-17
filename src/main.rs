@@ -134,6 +134,8 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Session(cmd) => launchd::session(&root, cmd)?,
         #[cfg(feature = "worktree")]
         Cmd::Worktree(cmd) => worktree(&root, &pf, cmd)?,
+        #[cfg(feature = "tool")]
+        Cmd::Tool(cmd) => tool(&root, &mut pf, &cwd, cmd)?,
         #[cfg(feature = "env")]
         Cmd::Env { envrc } => {
             if envrc {
@@ -296,5 +298,48 @@ fn worktree(root: &Path, pf: &Pullfile, cmd: cli::WorktreeCmd) -> Result<()> {
         }
         WorktreeCmd::Rm { name, force } => pull_worktree::remove(root, pf, &name, force)?,
     }
+    Ok(())
+}
+
+#[cfg(feature = "tool")]
+fn tool(root: &Path, pf: &mut Pullfile, cwd: &Path, cmd: cli::ToolCmd) -> Result<()> {
+    use cli::ToolCmd;
+    let print = |m: &pull_tool::Manifest| {
+        for (name, version) in &m.closure {
+            let mark = if m.linked.contains(name) { "*" } else { " " };
+            println!("{mark} {name} {version}");
+        }
+    };
+    match cmd {
+        ToolCmd::Sync => {}
+        ToolCmd::Add { names } => {
+            pull_tool::edit(root, pf, |p| p.add(&names))?;
+        }
+        ToolCmd::Rm { names } => {
+            pull_tool::edit(root, pf, |p| p.remove(&names))?;
+        }
+        ToolCmd::Import { file } => {
+            let other = pull_tool::read_brewfile(&cwd.join(file))?;
+            pull_tool::edit(root, pf, |p| {
+                let before = p.clone();
+                p.merge(other);
+                *p != before
+            })?;
+        }
+        ToolCmd::List => {
+            match pull_tool::manifest(root)? {
+                Some(m) => print(&m),
+                None => println!("not synced yet (run `pull tool sync`)"),
+            }
+            return Ok(());
+        }
+        ToolCmd::Gc => {
+            for k in pull_tool::gc()? {
+                println!("removed {k}");
+            }
+            return Ok(());
+        }
+    }
+    print(&pull_tool::sync(root, pf)?);
     Ok(())
 }

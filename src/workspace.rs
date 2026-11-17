@@ -18,6 +18,7 @@ const SECTIONS: &[(&str, &str)] = &[
     ("lint", "lint"),
     ("ignore", "ignore"),
     ("jobs", "launchd"),
+    ("tool", "tool"),
 ];
 
 /// Say so when the pullfile configures something this build can't do (the section is
@@ -32,22 +33,49 @@ pub fn warn_unsupported(pf: &Pullfile) {
 }
 
 /// The workspace environment: pullfile `env` + local.toml `[env]` with the `env` feature,
-/// otherwise just PULL_ROOT.
+/// otherwise just PULL_ROOT. With `tool`, the workspace profile's bin dirs are on PATH
+/// (after the `env` paths, so those can shadow packages).
 pub fn env(root: &Path, pf: &Pullfile) -> Result<Vec<(String, String)>> {
+    let tool_paths = tool_paths(root, pf);
     #[cfg(feature = "env")]
     {
+        // Lowest-priority layer: resolve puts later layers' paths first.
+        let tool = pull_env::Env {
+            path: tool_paths.iter().map(|p| p.display().to_string()).collect(),
+            ..Default::default()
+        };
         let shared: pull_env::Env = pf.section(pull_env::SECTION)?;
         let local: Option<pull_env::Env> = pull_core::Local::load(root)
             .ok()
             .map(|l| l.section(pull_env::SECTION))
             .transpose()?;
-        let layers: Vec<&pull_env::Env> = std::iter::once(&shared).chain(local.as_ref()).collect();
+        let layers: Vec<&pull_env::Env> = [&tool, &shared].into_iter().chain(local.as_ref()).collect();
         pull_env::resolve(root, &layers)
     }
     #[cfg(not(feature = "env"))]
     {
-        let _ = pf;
-        Ok(vec![("PULL_ROOT".into(), root.display().to_string())])
+        let mut out = vec![("PULL_ROOT".to_string(), root.display().to_string())];
+        if !tool_paths.is_empty() {
+            let current = std::env::var_os("PATH").unwrap_or_default();
+            let joined = std::env::join_paths(
+                tool_paths.into_iter().chain(std::env::split_paths(&current)),
+            )?;
+            out.push(("PATH".into(), joined.to_string_lossy().into_owned()));
+        }
+        Ok(out)
+    }
+}
+
+/// PATH entries of the workspace package profile (none without the `tool` feature).
+fn tool_paths(root: &Path, pf: &Pullfile) -> Vec<std::path::PathBuf> {
+    #[cfg(feature = "tool")]
+    {
+        pull_tool::path_entries(root, pf)
+    }
+    #[cfg(not(feature = "tool"))]
+    {
+        let _ = (root, pf);
+        Vec::new()
     }
 }
 

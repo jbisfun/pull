@@ -9,7 +9,7 @@ description = "Multi-repo git wrapper driven by pullfile.plist"
 # A pullfile section whose feature is compiled out (`env`, `hooks`, `lint`, `ignore`,
 # `jobs`) is kept verbatim when pull rewrites the pullfile, just not acted on.
 [features]
-default = ["env", "hooks", "lint", "conventional", "ignore", "worktree", "launchd", "mcp", "https", "ssh"]
+default = ["env", "hooks", "lint", "conventional", "ignore", "worktree", "launchd", "mcp", "tool", "https", "ssh"]
 # pullfile `env` + local.toml `[env]`; `pull env` / `pull shell`.
 env = ["dep:pull-env"]
 # pullfile `hooks`: precommit / postcommit / pull.
@@ -24,6 +24,8 @@ ignore = ["dep:pull-ignore"]
 worktree = ["dep:pull-worktree"]
 # pullfile `jobs`, `pull launchctl`, `pull session` (PTY job daemon); MCP session tools.
 launchd = ["dep:pull-launchd", "pull-mcp?/sessions"]
+# pullfile `tool`: workspace packages (Linuxbrew bottles) in .pull/tool, on PATH via env.
+tool = ["dep:pull-tool"]
 # `pull mcp`: MCP server for agents.
 mcp = ["dep:pull-mcp"]
 # git transports.
@@ -45,6 +47,7 @@ pull-ignore = { path = "crates/pull-ignore", optional = true }
 pull-worktree = { path = "crates/pull-worktree", optional = true }
 pull-launchd = { path = "crates/pull-launchd", optional = true }
 pull-mcp = { path = "crates/pull-mcp", optional = true, default-features = false }
+pull-tool = { path = "crates/pull-tool", optional = true }
 
 [workspace]
 members = ["crates/*"]

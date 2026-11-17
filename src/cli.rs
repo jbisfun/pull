@@ -105,6 +105,11 @@ pub enum Cmd {
     /// Workspace worktrees under .worktrees/NAME (every repo as a git worktree).
     #[command(subcommand)]
     Worktree(WorktreeCmd),
+    #[cfg(feature = "tool")]
+    /// Workspace packages: pullfile `tool` (Brewfile-style), poured from Linuxbrew bottles
+    /// and linked into .pull/tool (on PATH in `pull env`).
+    #[command(subcommand)]
+    Tool(ToolCmd),
     /// Run a command in every cloned repo (e.g. `pull each git log -1`).
     Each {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
@@ -208,6 +213,32 @@ pub enum SessionCmd {
     },
     /// Stop and remove a session.
     Kill { name: String },
+}
+
+#[cfg(feature = "tool")]
+#[derive(Subcommand)]
+pub enum ToolCmd {
+    /// Install the pullfile's packages and swap .pull/tool to exactly that set.
+    Sync,
+    /// Add formulae to the pullfile and sync.
+    Add {
+        #[arg(required = true)]
+        names: Vec<String>,
+    },
+    /// Remove formulae from the pullfile and sync.
+    Rm {
+        #[arg(required = true)]
+        names: Vec<String>,
+    },
+    /// Merge a Brewfile's taps and formulae into the pullfile and sync.
+    Import {
+        #[arg(default_value = "Brewfile")]
+        file: PathBuf,
+    },
+    /// List installed packages (`*` = linked into the profile).
+    List,
+    /// Delete store kegs that no workspace profile uses.
+    Gc,
 }
 
 #[cfg(feature = "worktree")]
