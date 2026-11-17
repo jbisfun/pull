@@ -92,6 +92,56 @@ pub fn is_dirty(repo: &Repository) -> Result<bool> {
     Ok(!repo.statuses(Some(&mut o))?.is_empty())
 }
 
+/// One changed path: index (staged) and worktree status letters, as in `git status -s`
+/// (`A M D R` / `?` for untracked / space for unchanged).
+#[derive(serde::Serialize, Debug, Clone)]
+pub struct Change {
+    pub path: String,
+    pub staged: char,
+    pub unstaged: char,
+}
+
+pub fn changes(repo: &Repository) -> Result<Vec<Change>> {
+    let mut o = StatusOptions::new();
+    o.include_untracked(true).recurse_untracked_dirs(true);
+    let mut out = Vec::new();
+    for e in repo.statuses(Some(&mut o))?.iter() {
+        let s = e.status();
+        if s.is_ignored() {
+            continue;
+        }
+        let staged = if s.is_index_new() {
+            'A'
+        } else if s.is_index_modified() || s.is_index_typechange() {
+            'M'
+        } else if s.is_index_deleted() {
+            'D'
+        } else if s.is_index_renamed() {
+            'R'
+        } else {
+            ' '
+        };
+        let unstaged = if s.is_wt_new() {
+            '?'
+        } else if s.is_wt_modified() || s.is_wt_typechange() {
+            'M'
+        } else if s.is_wt_deleted() {
+            'D'
+        } else if s.is_wt_renamed() {
+            'R'
+        } else {
+            ' '
+        };
+        let staged = if unstaged == '?' { '?' } else { staged };
+        out.push(Change {
+            path: e.path().unwrap_or("?").to_string(),
+            staged,
+            unstaged,
+        });
+    }
+    Ok(out)
+}
+
 pub fn status_lines(repo: &Repository) -> Result<Vec<String>> {
     let mut o = StatusOptions::new();
     o.include_untracked(true).recurse_untracked_dirs(false);
@@ -165,6 +215,19 @@ pub fn stage(repo: &Repository, paths: &[String]) -> Result<()> {
     idx.add_all(paths, IndexAddOption::DEFAULT, None)?;
     idx.update_all(paths, None)?;
     idx.write()?;
+    Ok(())
+}
+
+/// Remove paths from the index back to HEAD (`git reset -- paths`).
+pub fn unstage(repo: &Repository, paths: &[String]) -> Result<()> {
+    match repo.head().ok().and_then(|h| h.peel_to_commit().ok()) {
+        Some(head) => repo.reset_default(Some(head.as_object()), paths)?,
+        None => {
+            let mut idx = repo.index()?;
+            idx.remove_all(paths, None)?;
+            idx.write()?;
+        }
+    }
     Ok(())
 }
 

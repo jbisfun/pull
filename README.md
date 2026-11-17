@@ -36,8 +36,10 @@ With the default `email = none`, commits are written as `name <>`, so no email g
     pull repo add URL [--name] [--branch]   |  repo rm NAME  |  repo list
     pull sync                      clone missing repos, fetch, fast-forward to the pins
     pull update                    fast-forward to upstream branches and re-pin
-    pull status
+    pull status [--json]           --json: root, lint rules, per-repo branch/head/pin,
+                                   ahead/behind and changed files (for tools)
     pull add PATHS...              each path is staged in the repo that contains it
+    pull unstage PATHS...          back to HEAD, routed the same way
     pull commit -m MSG [-a] [PATHS...] [--no-verify]
     pull push
     pull lint MSG  |  pull whoami  |  pull each CMD...

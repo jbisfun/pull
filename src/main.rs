@@ -38,7 +38,16 @@ enum Cmd {
     /// Fetch and fast-forward every repo to its upstream branch, then re-pin. Runs `pull` hooks.
     Update,
     /// Show branch, pin and changes for every repo.
-    Status,
+    Status {
+        /// Machine-readable: per repo branch, head, pin, ahead/behind and changed files.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Unstage paths (back to HEAD); each path is routed to its repo.
+    Unstage {
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+    },
     /// Stage paths; each path is routed to the repo it lives in.
     Add {
         #[arg(required = true)]
@@ -289,7 +298,13 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Sync => sync(&root, &mut pf, false)?,
         Cmd::Update => sync(&root, &mut pf, true)?,
-        Cmd::Status => status(&root, &pf)?,
+        Cmd::Status { json: false } => status(&root, &pf)?,
+        Cmd::Status { json: true } => status_json(&root, &pf)?,
+        Cmd::Unstage { paths } => {
+            for (name, rel) in route(&root, &pf, &cwd, &paths)? {
+                git::unstage(&open(&root, &name)?, &rel)?;
+            }
+        }
         Cmd::Add { paths } => {
             for (name, rel) in route(&root, &pf, &cwd, &paths)? {
                 git::stage(&open(&root, &name)?, &rel)?;
@@ -989,5 +1004,61 @@ fn session(root: &Path, cmd: SessionCmd) -> Result<()> {
             client::request(root, &Request::Unload { label: name })?;
         }
     }
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct RepoStatus {
+    name: String,
+    path: String,
+    cloned: bool,
+    branch: Option<String>,
+    head: Option<String>,
+    pinned: Option<String>,
+    ahead: usize,
+    behind: usize,
+    changes: Vec<git::Change>,
+}
+
+fn status_json(root: &Path, pf: &Pullfile) -> Result<()> {
+    let mut out = Vec::new();
+    for r in &pf.repos {
+        let mut st = RepoStatus {
+            name: r.name.clone(),
+            path: root.join(&r.name).display().to_string(),
+            cloned: false,
+            branch: None,
+            head: None,
+            pinned: r.commit.clone(),
+            ahead: 0,
+            behind: 0,
+            changes: Vec::new(),
+        };
+        if let Ok(repo) = Repository::open(root.join(&r.name)) {
+            st.cloned = true;
+            st.branch = repo
+                .head()
+                .ok()
+                .and_then(|h| h.shorthand().ok().map(String::from));
+            let head = git::head_oid(&repo);
+            st.head = head.map(|h| h.to_string());
+            if let (Some(h), Some(o)) = (head, git::remote_oid(&repo, &r.branch))
+                && h != o
+            {
+                (st.ahead, st.behind) = repo.graph_ahead_behind(h, o)?;
+            }
+            st.changes = git::changes(&repo)?;
+        }
+        out.push(st);
+    }
+    let doc = serde_json::json!({
+        "root": root.display().to_string(),
+        "lint": {
+            "max_subject_length": pf.lint.max_subject_length,
+            "no_description": pf.lint.no_description,
+        },
+        "repos": out,
+    });
+    println!("{}", serde_json::to_string_pretty(&doc)?);
     Ok(())
 }
