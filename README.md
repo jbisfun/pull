@@ -53,6 +53,23 @@ The pullfile's `ignore` array holds gitignore patterns for every repo, e.g.
 .gitignore entries and nothing is committed for it. Patterns don't untrack files that are
 already committed; `git rm --cached` those.
 
+## MCP server
+
+`pull mcp [--root DIR]` serves the workspace to agents over MCP (stdio):
+
+    workspace                      repos, branches, pins, ahead/behind, changes, env, jobs
+    status / diff / log            per repo or across all repos
+    grep / list_files / read_file  ripgrep's engine, .gitignore-aware, confined to the root
+    exec                           run a command to completion with the workspace env
+    session_new / session_run / session_send / session_capture / session_list /
+    session_kill                   stateful terminals (the sessions below); a human can
+                                   `pull session attach` to the same one
+    job                            start/stop/restart/unload pullfile jobs
+
+Register it with an agent, e.g. Hermes:
+
+    hermes mcp add pull --command pull --args mcp --root ~/jbisfun
+
 ## Jobs and sessions (launchd)
 
 pull ports launchd's job model (Apple's launchd, `liblaunch/launch.h`) to the workspace.

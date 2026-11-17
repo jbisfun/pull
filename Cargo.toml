@@ -11,12 +11,20 @@ crossterm = "0.29.0"
 dirs = "7.0.0"
 git-conventional = "1.1.0"
 git2 = { version = "0.21.0", features = ["https", "ssh"] }
+grep-matcher = "0.1.9"
+grep-regex = "0.1.14"
+grep-searcher = "0.1.17"
+ignore = "0.4.34"
+jiff = "1.0.0"
 nix = { version = "0.32.0", features = ["signal", "process", "term"] }
 plist = "1.10.4"
 portable-pty = "0.9.0"
+rmcp = { version = "3.10.0", features = ["server", "transport-io", "macros"] }
+schemars = "1.2.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 shellexpand = "3.1.2"
 shlex = "2.0.1"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "io-std", "process", "time"] }
 toml = "1.2.1"
 vt100 = "0.18.1"

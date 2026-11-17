@@ -4,6 +4,7 @@ mod git;
 mod hooks;
 mod launchd;
 mod lint;
+mod mcp;
 mod worktree;
 
 use anyhow::{Context, Result, bail};
@@ -72,6 +73,12 @@ enum Cmd {
     Shell {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
+    },
+    /// MCP server on stdio for agents: multi-repo context, programs, stateful terminals.
+    Mcp {
+        /// Workspace root (default: found from the current directory).
+        #[arg(long)]
+        root: Option<PathBuf>,
     },
     /// Run the workspace job daemon in the foreground (started automatically when needed).
     #[command(hide = true)]
@@ -231,6 +238,9 @@ fn run(cli: Cli) -> Result<()> {
     if let Cmd::Init { org } = &cli.cmd {
         return init(&cwd, org.clone());
     }
+    if let Cmd::Mcp { root: Some(r) } = &cli.cmd {
+        return mcp::serve(config::find_root(r)?);
+    }
     let root = config::find_root(&cwd)?;
     let mut pf = Pullfile::load(&root)?;
     apply_ignores(&root, &pf);
@@ -337,6 +347,7 @@ fn run(cli: Cli) -> Result<()> {
                 println!("org: {o}");
             }
         }
+        Cmd::Mcp { .. } => mcp::serve(root)?,
         Cmd::Launchd => {
             ensure_ignored(&root, "/.pull/")?;
             launchd::daemon::run(&root)?
