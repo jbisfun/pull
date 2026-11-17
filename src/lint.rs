@@ -24,9 +24,10 @@ pub fn check(rules: &Lint, msg: &str) -> Vec<String> {
         out.push("no_trailing_period: subject ends with '.'".into());
     }
     if rules.conventional
-        && let Err(e) = git_conventional::Commit::parse(msg) {
-            out.push(format!("conventional: {e}"));
-        }
+        && let Err(e) = git_conventional::Commit::parse(msg)
+    {
+        out.push(format!("conventional: {e}"));
+    }
     out
 }
 

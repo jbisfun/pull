@@ -12,6 +12,9 @@ pub const LOCAL: &str = "local.toml";
 #[serde(default)]
 pub struct Pullfile {
     pub identity: IdentityPolicy,
+    /// Shared environment, like an .envrc for the whole workspace.
+    #[serde(skip_serializing_if = "Env::is_empty")]
+    pub env: Env,
     pub lint: Lint,
     pub hooks: Hooks,
     pub repos: Vec<Repo>,
@@ -65,6 +68,25 @@ pub struct Lint {
     pub no_trailing_period: bool,
 }
 
+/// Environment for the workspace. Values expand `~`, `$VAR` and `${VAR}` (including
+/// `$PULL_ROOT`); relative PATH entries are relative to the pullfile root.
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+#[serde(default)]
+pub struct Env {
+    /// Prepended to PATH, first entry wins.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub path: Vec<String>,
+    /// Exported variables (toolchain selection, etc.).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub vars: BTreeMap<String, String>,
+}
+
+impl Env {
+    pub fn is_empty(&self) -> bool {
+        self.path.is_empty() && self.vars.is_empty()
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 #[serde(default)]
 pub struct Hooks {
@@ -104,6 +126,9 @@ pub struct Local {
     pub gpg_program: Option<String>,
     #[serde(default)]
     pub orgs: BTreeMap<String, OrgIdentity>,
+    /// Machine-specific env layered over the pullfile's (`[env]` with `path`/`vars`).
+    #[serde(default, skip_serializing_if = "Env::is_empty")]
+    pub env: Env,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]

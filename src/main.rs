@@ -1,4 +1,5 @@
 mod config;
+mod env;
 mod git;
 mod hooks;
 mod lint;
@@ -59,6 +60,17 @@ enum Cmd {
     Lint { message: String },
     /// Print the identity commits will be written with.
     Whoami,
+    /// Print the workspace env (pullfile `env` + local.toml `[env]`) as shell exports.
+    /// `eval "$(pull env)"`, or `--envrc` to write a direnv .envrc that does it.
+    Env {
+        #[arg(long)]
+        envrc: bool,
+    },
+    /// Start $SHELL (or the given command) with the workspace env applied.
+    Shell {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        cmd: Vec<String>,
+    },
     /// Run a command in every cloned repo (e.g. `pull each git log -1`).
     Each {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
@@ -166,14 +178,14 @@ fn run(cli: Cli) -> Result<()> {
             // The root repo (if any) carries the pullfile itself.
             if let Some(repo) = root_repo(&root)
                 && repo.find_remote("origin").is_ok()
-                    && let Some(b) = repo
-                        .head()
-                        .ok()
-                        .and_then(|h| h.shorthand().ok().map(String::from))
-                    {
-                        println!("(root): pushing {b}");
-                        git::push(&repo, &b).context("(root)")?;
-                    }
+                && let Some(b) = repo
+                    .head()
+                    .ok()
+                    .and_then(|h| h.shorthand().ok().map(String::from))
+            {
+                println!("(root): pushing {b}");
+                git::push(&repo, &b).context("(root)")?;
+            }
         }
         Cmd::Lint { message } => {
             let msg = git2::message_prettify(&message, None)?;
@@ -199,7 +211,30 @@ fn run(cli: Cli) -> Result<()> {
                 println!("org: {o}");
             }
         }
+        Cmd::Env { envrc } => {
+            if envrc {
+                let p = root.join(".envrc");
+                std::fs::write(&p, env::ENVRC)?;
+                println!("wrote {} (run `direnv allow` there)", p.display());
+            } else {
+                print!("{}", env::exports(&workspace_env(&root, &pf)?)?);
+            }
+        }
+        Cmd::Shell { cmd } => {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+            let (prog, args) = match cmd.split_first() {
+                Some((p, a)) => (p.clone(), a.to_vec()),
+                None => (shell, Vec::new()),
+            };
+            let st = std::process::Command::new(&prog)
+                .args(&args)
+                .envs(workspace_env(&root, &pf)?)
+                .status()
+                .with_context(|| format!("running {prog}"))?;
+            std::process::exit(st.code().unwrap_or(1));
+        }
         Cmd::Each { cmd } => {
+            let vars = workspace_env(&root, &pf)?;
             for r in &pf.repos {
                 let dir = root.join(&r.name);
                 if !dir.exists() {
@@ -208,6 +243,7 @@ fn run(cli: Cli) -> Result<()> {
                 println!("== {}", r.name);
                 let st = std::process::Command::new(&cmd[0])
                     .args(&cmd[1..])
+                    .envs(vars.iter().map(|(k, v)| (k, v)))
                     .current_dir(&dir)
                     .status()?;
                 if !st.success() {
@@ -300,19 +336,22 @@ fn sync(root: &Path, pf: &mut Pullfile, to_upstream: bool) -> Result<()> {
                 repo
             };
             // A fresh clone lands on upstream HEAD; put it on the pin instead.
-            if fresh && !to_upstream
-                && let Some(pin) = r.commit.as_deref() {
-                    git::reset_hard(&repo, git2::Oid::from_str(pin)?)?;
-                }
+            if fresh
+                && !to_upstream
+                && let Some(pin) = r.commit.as_deref()
+            {
+                git::reset_hard(&repo, git2::Oid::from_str(pin)?)?;
+            }
             let target = if to_upstream {
                 git::remote_oid(&repo, &r.branch)
             } else {
                 r.commit.as_deref().map(git2::Oid::from_str).transpose()?
             };
             if let Some(t) = target
-                && git::fast_forward(&repo, t)? {
-                    println!("{}: -> {}", r.name, git::short(t));
-                }
+                && git::fast_forward(&repo, t)?
+            {
+                println!("{}: -> {}", r.name, git::short(t));
+            }
             if to_upstream {
                 let head = git::head_oid(&repo).map(|o| o.to_string());
                 if head.is_some() && head != r.commit {
@@ -334,7 +373,14 @@ fn sync(root: &Path, pf: &mut Pullfile, to_upstream: bool) -> Result<()> {
         bail!("failed: {}", failed.join(", "));
     }
     let names: Vec<_> = pf.repos.iter().map(|r| r.name.clone()).collect();
-    hooks::run("pull", &pf.hooks.pull, root, &names, &[])
+    hooks::run(
+        "pull",
+        &pf.hooks.pull,
+        root,
+        &names,
+        &workspace_env(root, pf)?,
+        &[],
+    )
 }
 
 fn status(root: &Path, pf: &Pullfile) -> Result<()> {
@@ -358,10 +404,11 @@ fn status(root: &Path, pf: &Pullfile) -> Result<()> {
             _ => {}
         }
         if let (Some(h), Some(o)) = (head, git::remote_oid(&repo, &r.branch))
-            && h != o {
-                let (a, b) = repo.graph_ahead_behind(h, o)?;
-                flags.push(format!("+{a}/-{b} origin"));
-            }
+            && h != o
+        {
+            let (a, b) = repo.graph_ahead_behind(h, o)?;
+            flags.push(format!("+{a}/-{b} origin"));
+        }
         let h = head.map(git::short).unwrap_or("-".into());
         println!("{} [{branch} {h}] {}", r.name, flags.join(", "));
         for l in git::status_lines(&repo)? {
@@ -438,7 +485,6 @@ fn commit(
 
     // Stage, then collect repos with something to commit.
     let routed = route(root, pf, cwd, paths)?;
-    let mut targets = Vec::new();
     for r in &pf.repos {
         let Ok(repo) = Repository::open(root.join(&r.name)) else {
             continue;
@@ -449,13 +495,9 @@ fn commit(
         if let Some(specs) = routed.get(&r.name) {
             git::stage(&repo, specs)?;
         }
-        if git::has_staged(&repo)? {
-            targets.push(r.name.clone());
-        }
     }
-    if targets.is_empty() {
-        bail!("nothing staged in any repo");
-    }
+    let vars = workspace_env(root, pf)?;
+    let mut targets = staged_repos(root, pf)?;
 
     if !no_verify {
         hooks::run(
@@ -463,8 +505,14 @@ fn commit(
             &pf.hooks.precommit,
             root,
             &targets,
+            &vars,
             &[("PULL_MESSAGE", &msg)],
         )?;
+        // Like git, whatever the hook staged is part of the commit.
+        targets = staged_repos(root, pf)?;
+    }
+    if targets.is_empty() {
+        bail!("nothing staged in any repo");
     }
 
     for name in &targets {
@@ -490,8 +538,27 @@ fn commit(
             &pf.hooks.postcommit,
             root,
             &targets,
+            &vars,
             &[("PULL_MESSAGE", &msg)],
         )?;
     }
     Ok(())
+}
+
+fn staged_repos(root: &Path, pf: &Pullfile) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for r in &pf.repos {
+        if let Ok(repo) = Repository::open(root.join(&r.name))
+            && git::has_staged(&repo)?
+        {
+            out.push(r.name.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// pullfile `env` + local.toml `[env]` (local.toml is optional here).
+fn workspace_env(root: &Path, pf: &Pullfile) -> Result<Vec<(String, String)>> {
+    let local = Local::load(root).ok();
+    env::resolve(root, pf, local.as_ref())
 }
