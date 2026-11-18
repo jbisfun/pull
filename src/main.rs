@@ -126,6 +126,8 @@ fn run(cli: Cli) -> Result<()> {
         }
         #[cfg(feature = "mcp")]
         Cmd::Mcp { .. } => mcp(root)?,
+        #[cfg(feature = "mcp")]
+        Cmd::McpServers => mcp_servers_json(&root)?,
         #[cfg(feature = "launchd")]
         Cmd::Launchd => launchd::daemon(&root, &pf)?,
         #[cfg(feature = "launchd")]
@@ -277,6 +279,68 @@ fn status_json(root: &Path, pf: &Pullfile) -> Result<()> {
 fn mcp(root: PathBuf) -> Result<()> {
     let env = std::sync::Arc::new(workspace::env_provider(&root));
     pull_mcp::serve(root, env)
+}
+
+/// A pullfile `mcp_servers` entry: `{command, args}`, kept raw (no env/root here — that's
+/// filled in per workspace by [`mcp_servers_json`]).
+#[cfg(feature = "mcp")]
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct McpServerConfig {
+    /// Defaults to the section key.
+    command: Option<String>,
+    args: Vec<String>,
+}
+
+/// `pull` itself, plus every pullfile `mcp_servers` entry, as `{name: {command, args,
+/// env}}` ready for an editor/agent's MCP settings: `command` resolved on PATH (`command
+/// -v`, falling back to the bare name) and `PULL_ROOT` always set.
+#[cfg(feature = "mcp")]
+fn mcp_servers_json(root: &Path) -> Result<()> {
+    let pf = Pullfile::load(root)?;
+    let mut servers = serde_json::Map::new();
+    servers.insert(
+        "pull".to_string(),
+        serde_json::json!({
+            "command": resolve_command("pull"),
+            "args": ["mcp", "--root", root.display().to_string()],
+        }),
+    );
+    let configured: std::collections::BTreeMap<String, McpServerConfig> =
+        pf.section("mcp_servers")?;
+    for (name, cfg) in configured {
+        let command = resolve_command(cfg.command.as_deref().unwrap_or(&name));
+        servers.insert(
+            name,
+            serde_json::json!({
+                "command": command,
+                "args": cfg.args,
+                "env": { "PULL_ROOT": root.display().to_string() },
+            }),
+        );
+    }
+    println!("{}", serde_json::to_string_pretty(&servers)?);
+    Ok(())
+}
+
+/// `name`'s absolute path on `$PATH` (`command -v`), or `name` itself if that fails.
+#[cfg(feature = "mcp")]
+fn resolve_command(name: &str) -> String {
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v -- {}", shell_quote(name)))
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| name.to_string())
+}
+
+#[cfg(feature = "mcp")]
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 #[cfg(feature = "worktree")]

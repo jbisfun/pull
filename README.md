@@ -107,6 +107,19 @@ Register it with an agent, e.g. Hermes:
 
     hermes mcp add pull --command pull --args mcp --root /path/to/workspace
 
+`pull mcp-servers` prints `pull` itself plus every pullfile `mcp_servers` entry as JSON
+(`{name: {command, args, env}}`, command resolved on `$PATH`, `PULL_ROOT` set), for an
+editor/agent to register the whole set at once. A pullfile entry needs only a `command`
+(defaults to the key) and `args`:
+
+    <key>mcp_servers</key>
+    <dict>
+        <key>radar</key>
+        <dict><key>args</key><array><string>mcp</string></array></dict>
+    </dict>
+
+ycode-pull reads `pull mcp-servers` to register all of them in one go.
+
 ## Jobs and sessions (launchd)
 
 pull ports launchd's job model (Apple's launchd, `liblaunch/launch.h`) to the workspace.

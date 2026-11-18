@@ -1954,6 +1954,7 @@ dependencies = [
  "pull-mcp",
  "pull-tool",
  "pull-worktree",
+ "serde",
  "serde_json",
  "toml",
 ]

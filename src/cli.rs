@@ -88,6 +88,11 @@ pub enum Cmd {
         #[arg(long)]
         root: Option<PathBuf>,
     },
+    #[cfg(feature = "mcp")]
+    /// MCP servers for this workspace as JSON (built-in `pull`, plus the pullfile
+    /// `mcp_servers` section), command resolved via `command -v` and `PULL_ROOT` set:
+    /// for an editor/agent to register directly.
+    McpServers,
     #[cfg(feature = "launchd")]
     /// Run the workspace job daemon in the foreground (started automatically when needed).
     #[command(hide = true)]
