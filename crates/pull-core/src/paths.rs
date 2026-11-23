@@ -6,7 +6,8 @@ use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 /// Map user paths onto (repo name -> repo-relative pathspecs), CODEOWNERS-style:
-/// the first path component under the root picks the repo.
+/// the repo whose directory (its name, possibly nested like `group/repo`) is the
+/// longest prefix of the path picks the repo.
 pub fn route(
     root: &Path,
     pf: &Pullfile,
@@ -19,20 +20,23 @@ pub fn route(
         let rel = abs
             .strip_prefix(root)
             .map_err(|_| anyhow::anyhow!("{} is outside the pullfile root", p.display()))?;
-        let mut comps = rel.components();
-        let Some(Component::Normal(first)) = comps.next() else {
+        if !matches!(rel.components().next(), Some(Component::Normal(_))) {
             // The root itself: everything in every repo.
             for r in &pf.repos {
                 out.entry(r.name.clone()).or_default().push("*".into());
             }
             continue;
-        };
-        let name = first.to_string_lossy().to_string();
-        if !pf.repos.iter().any(|r| r.name == name) {
-            bail!("{} is not inside any repo in {PULLFILE}", p.display());
         }
-        let inner = comps.as_path().to_string_lossy().to_string();
-        out.entry(name)
+        let Some((name, inner)) = pf
+            .repos
+            .iter()
+            .filter_map(|r| rel.strip_prefix(&r.name).ok().map(|inner| (&r.name, inner)))
+            .max_by_key(|(name, _)| Path::new(name).components().count())
+        else {
+            bail!("{} is not inside any repo in {PULLFILE}", p.display());
+        };
+        let inner = inner.to_string_lossy().to_string();
+        out.entry(name.clone())
             .or_default()
             .push(if inner.is_empty() { "*".into() } else { inner });
     }
