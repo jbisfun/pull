@@ -5,7 +5,8 @@
 //! launchd sessions: they persist between calls and across agents, and a human can
 //! attach to the same terminal with `pull session attach`).
 //!
-//! The session/job tools need the `sessions` build option (pkgs/launchd). The
+//! The session/job tools need the `sessions` build option (pkgs/launchd), the
+//! haxy_* issue tools the `haxy` one (pkgs/haxy). The
 //! workspace env and the pullfile jobs are injected by the bin.
 const std = @import("std");
 const parley = @import("parley");
@@ -15,6 +16,7 @@ const args_mod = @import("args.zig");
 const tools = @import("tools.zig");
 pub const sessions = if (opts.sessions) @import("sessions.zig") else struct {};
 const launchd = if (opts.sessions) @import("launchd") else struct {};
+const haxy = if (opts.haxy) @import("haxy.zig") else struct {};
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -51,7 +53,8 @@ pub const instructions = "pull workspace: several git repos under one root, mana
     "for an overview, then status/diff/log/grep/list_files/read_file across repos. " ++
     "`exec` runs a command to completion with the workspace env; sessions are stateful " ++
     "terminals (PTYs) that persist between calls and can be attached to by a human. " ++
-    "Commit with `pull commit -m MSG PATHS` via exec (subject lint applies).";
+    "Commit with `pull commit -m MSG PATHS` via exec (subject lint applies)." ++
+    (if (opts.haxy) " Repos with a `haxy/events` branch carry haxy issues: haxy_* tools." else "");
 
 /// A tool as registered: its spec (schema byte for byte as the Rust server's
 /// schemars output), the fields its arguments are checked against, and its body.
@@ -90,7 +93,9 @@ const Tool = struct {
 /// Every tool this build serves, sorted by name (rmcp lists them so).
 pub fn defs() []const Def {
     const all = comptime blk: {
-        var arr = if (opts.sessions) tools.defs ++ sessions.defs.* else tools.defs;
+        @setEvalBranchQuota(100_000);
+        const base = if (opts.sessions) tools.defs ++ sessions.defs.* else tools.defs;
+        var arr = if (opts.haxy) base ++ haxy.defs.* else base;
         std.mem.sortUnstable(Def, &arr, {}, struct {
             fn lt(_: void, x: Def, y: Def) bool {
                 return std.mem.lessThan(u8, x.name, y.name);
@@ -130,5 +135,6 @@ test {
     _ = args_mod;
     _ = tools;
     if (opts.sessions) _ = sessions;
-    try std.testing.expect(defs().len == if (opts.sessions) 15 else 8);
+    if (opts.haxy) _ = haxy;
+    try std.testing.expect(defs().len == @as(usize, if (opts.sessions) 15 else 8) + if (opts.haxy) 7 else 0);
 }

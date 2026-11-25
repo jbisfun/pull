@@ -7,6 +7,7 @@
         .core = .{ .path = "../core" },
         .git = .{ .path = "../git" },
         .launchd = .{ .path = "../launchd", .lazy = true },
+        .haxy = .{ .path = "../haxy", .lazy = true },
         .parley = .{
             .url = "git+https://github.com/pedronaugusto/parley#3dffee3a0e074d6cfb5be647f5a4694c2fd9ad9d",
             .hash = "parley-0.8.0-x3fwY1idCwCLQPMDQif0tjRyIbXpzYaMJ2l0mVuqHSUp",

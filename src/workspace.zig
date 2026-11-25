@@ -13,6 +13,7 @@ const hooks_pkg = if (opts.hooks) @import("hooks") else struct {};
 const lint_pkg = if (opts.lint) @import("lint") else struct {};
 const ignore_pkg = if (opts.ignore) @import("ignore") else struct {};
 const tool_pkg = if (opts.tool) @import("tool") else struct {};
+const haxy_pkg = if (opts.haxy) @import("haxy") else struct {};
 
 /// Enabled build features (`pull --version`, `status --json`).
 pub const features = opts.features;
@@ -81,6 +82,10 @@ pub fn workspaceEnv(a: Allocator, root: []const u8) []const EnvVar {
     const pf = core.Pullfile.load(a, root) catch return &.{};
     return env(a, root, pf) catch &.{};
 }
+
+/// Refspecs `pull sync` fetches besides the branches: haxy's events branch with
+/// the `haxy` feature (xit's `refs/heads/*` glob doesn't reach `haxy/events`).
+pub const fetch_specs: []const []const u8 = if (opts.haxy) &.{haxy_pkg.FETCH_SPEC} else &.{};
 
 pub const Hook = enum { precommit, postcommit, pull };
 

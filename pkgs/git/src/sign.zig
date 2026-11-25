@@ -25,7 +25,7 @@ pub fn commitBuffer(
     a: Allocator,
     id: core.Identity,
     tree: [40]u8,
-    parent: ?[40]u8,
+    parents: []const [40]u8,
     msg: []const u8,
     secs: i64,
     offset_min: i32,
@@ -34,7 +34,7 @@ pub fn commitBuffer(
     const who = try std.fmt.allocPrint(a, "{s} <{s}> {d} {s}", .{ trimCrud(id.name), trimCrud(id.email), secs, &tz });
     var header: std.ArrayList(u8) = .empty;
     try header.print(a, "tree {s}\n", .{&tree});
-    if (parent) |p| try header.print(a, "parent {s}\n", .{&p});
+    for (parents) |p| try header.print(a, "parent {s}\n", .{&p});
     try header.print(a, "author {s}\ncommitter {s}\n", .{ who, who });
     const unsigned = try std.fmt.allocPrint(a, "{s}\n{s}", .{ header.items, msg });
     if (!id.sign) return unsigned;
@@ -72,7 +72,7 @@ test "unsigned buffer layout" {
     defer arena.deinit();
     const id: core.Identity = .{ .name = "jp", .email = "", .sign = false, .signing_key = null, .gpg_program = "gpg" };
     const tree: [40]u8 = @splat('a');
-    const buf = try commitBuffer(arena.allocator(), id, tree, null, "msg\n", 100, -300);
+    const buf = try commitBuffer(arena.allocator(), id, tree, &.{}, "msg\n", 100, -300);
     const want = try std.fmt.allocPrint(arena.allocator(), "tree {s}\nauthor jp <> 100 -0500\ncommitter jp <> 100 -0500\n\nmsg\n", .{&tree});
     try std.testing.expectEqualStrings(want, buf);
 }

@@ -47,12 +47,13 @@ pub fn excludeFromRootRepo(a: Allocator, root: []const u8, name: []const u8) !vo
 }
 
 /// Clone missing repos, fetch, and fast-forward to the pins (or, `to_upstream`, to
-/// the upstream branches and re-pin). Saves the pullfile if pins changed.
-pub fn sync(a: Allocator, root: []const u8, pf: *core.Pullfile, to_upstream: bool) !void {
+/// the upstream branches and re-pin). Saves the pullfile if pins changed. `extra`:
+/// refspecs fetched from origin as well (skipped where origin lacks the ref).
+pub fn sync(a: Allocator, root: []const u8, pf: *core.Pullfile, to_upstream: bool, extra: []const []const u8) !void {
     var failed: std.ArrayList([]const u8) = .empty;
     var changed = false;
     for (pf.repos.items) |*r| {
-        syncOne(a, root, r, to_upstream, &changed) catch |e| {
+        syncOne(a, root, r, to_upstream, extra, &changed) catch |e| {
             sys.err("{s}: {s}\n", .{ r.name, sys.describe(e) });
             try failed.append(a, r.name);
         };
@@ -63,7 +64,7 @@ pub fn sync(a: Allocator, root: []const u8, pf: *core.Pullfile, to_upstream: boo
     }
 }
 
-fn syncOne(a: Allocator, root: []const u8, r: *core.Repo, to_upstream: bool, changed: *bool) !void {
+fn syncOne(a: Allocator, root: []const u8, r: *core.Repo, to_upstream: bool, extra: []const []const u8, changed: *bool) !void {
     const dir = try std.fs.path.join(a, &.{ root, r.name });
     const fresh = !sys.exists(try std.fs.path.join(a, &.{ dir, ".git" }));
     const repo = if (fresh) blk: {
@@ -75,6 +76,7 @@ fn syncOne(a: Allocator, root: []const u8, r: *core.Repo, to_upstream: bool, cha
         break :blk repo;
     };
     defer repo.close();
+    if (extra.len > 0) try repo.fetchSpecs(extra);
     // A fresh clone lands on upstream HEAD; put it on the pin instead.
     if (fresh and !to_upstream) if (r.commit) |pin| try repo.resetHard(try repo_mod.parseOid(pin));
     const target: ?Oid = if (to_upstream)

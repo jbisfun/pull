@@ -23,7 +23,9 @@ feature requires another:
     pkgs/worktree  worktree       pull worktree
     pkgs/tool      tool           pullfile `tool`; pull tool
     pkgs/launchd   launchd        pullfile `jobs`; pull launchctl / pull session
-    pkgs/mcp       mcp            pull mcp (session/job tools only with `launchd`)
+    pkgs/haxy      haxy           pull haxy (issues on haxy's `haxy/events` branch)
+    pkgs/mcp       mcp            pull mcp (session/job tools only with `launchd`,
+                                  haxy_* tools only with `haxy`)
 
 All features are on by default. Install to ~/.local/bin:
 
@@ -107,6 +109,8 @@ already committed; `git rm --cached` those.
     session_kill                   stateful terminals (the sessions below); a human can
                                    `pull session attach` to the same one
     job                            start/stop/restart/unload pullfile jobs
+    haxy_issues / haxy_issue / haxy_new_issue / haxy_comment / haxy_close /
+    haxy_reopen / haxy_sync        haxy issues (below)
 
 Register it with an agent, e.g. Hermes:
 
@@ -124,6 +128,24 @@ editor/agent to register the whole set at once. A pullfile entry needs only a `c
     </dict>
 
 ycode-pull reads `pull mcp-servers` to register all of them in one go.
+
+## haxy issues
+
+[haxy](https://github.com/jbisfun/haxy) keeps a repo's issues as JSON event commits on a
+`haxy/events` branch. `pull sync` fetches that branch too (to `origin/haxy/events`), and:
+
+    pull haxy issues [REPO] [--all] [--json]   open (--all: every) issue per repo
+    pull haxy show REPO ISSUE                  description and comments
+    pull haxy new REPO -t TITLE [-b BODY] [-l LABELS]
+    pull haxy comment REPO ISSUE TEXT  |  close REPO ISSUE  |  reopen REPO ISSUE
+    pull haxy sync [REPO...]                   fetch, fast-forward or merge, push
+    pull haxy open REPO                        run `haxy` (TUI + local web UI) there
+
+ISSUE is an id or a unique prefix of one. Events are written as haxy's local mode writes
+them, with pull's identity (and GPG signature), so `haxy` reads them; sync is haxy's own
+(an empty-tree merge commit when both sides moved). Listing replays the events (local
+branch, else origin's); concurrent edits of one issue resolve by causal order then time,
+where haxy would flag a field conflict.
 
 ## Jobs and sessions (launchd)
 

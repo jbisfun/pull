@@ -509,20 +509,7 @@ pub const Repo = struct {
             .cli => try parseOid(std.mem.trim(u8, try r.git(&.{"write-tree"}), " \r\n")),
         };
         const t = sys.now();
-        const content = try sign.commitBuffer(r.a, id, tree_oid, parent, msg, t.secs, t.offset_min);
-        const oid: Oid = switch (r.backend) {
-            .xit => blk: {
-                var bytes: [20]u8 = undefined;
-                var reader = std.Io.Reader.fixed(content);
-                try obj.writeObject(.git, xopts, r.rw(), sys.io, gpa, &reader, .{ .kind = .commit, .size = content.len }, &bytes);
-                break :blk std.fmt.bytesToHex(bytes, .lower);
-            },
-            // git CLI fallback
-            .cli => blk: {
-                const out = try runGit(r.a, r.path, &.{ "hash-object", "-t", "commit", "-w", "--stdin" }, content);
-                break :blk try parseOid(std.mem.trim(u8, out, " \r\n"));
-            },
-        };
+        const oid = try r.commitObject(id, tree_oid, if (parent) |p| &.{p} else &.{}, msg, t);
         const subject = std.mem.sliceTo(msg, '\n');
         const reflog = try std.fmt.allocPrint(r.a, "commit: {s}", .{subject});
         switch (r.backend) {
@@ -554,6 +541,66 @@ pub const Repo = struct {
             const len = try f.length(sys.io);
             try f.writePositionalAll(sys.io, line, len);
         }
+    }
+
+    // ------------------------------------------------------------ objects
+
+    pub const Time = @TypeOf(sys.now());
+
+    /// Write a commit object (GPG-signed when `id.sign`) without moving any ref.
+    pub fn commitObject(r: *Repo, id: core.Identity, tree: Oid, parents: []const Oid, msg: []const u8, t: Time) !Oid {
+        const content = try sign.commitBuffer(r.a, id, tree, parents, msg, t.secs, t.offset_min);
+        switch (r.backend) {
+            .xit => {
+                var bytes: [20]u8 = undefined;
+                var reader = std.Io.Reader.fixed(content);
+                try obj.writeObject(.git, xopts, r.rw(), sys.io, gpa, &reader, .{ .kind = .commit, .size = content.len }, &bytes);
+                return std.fmt.bytesToHex(bytes, .lower);
+            },
+            // git CLI fallback
+            .cli => {
+                const out = try runGit(r.a, r.path, &.{ "hash-object", "-t", "commit", "-w", "--stdin" }, content);
+                return parseOid(std.mem.trim(u8, out, " \r\n"));
+            },
+        }
+    }
+
+    /// The empty tree, written to the object store.
+    pub fn emptyTree(r: *Repo) !Oid {
+        switch (r.backend) {
+            .xit => {
+                var tree = try obj.Tree.init(gpa);
+                defer tree.deinit();
+                var bytes: [20]u8 = undefined;
+                try obj.writeTree(.git, xopts, r.rw(), sys.io, gpa, &tree, &bytes);
+                return std.fmt.bytesToHex(bytes, .lower);
+            },
+            // git CLI fallback
+            .cli => return parseOid(std.mem.trim(u8, try runGit(r.a, r.path, &.{ "hash-object", "-t", "tree", "-w", "--stdin" }, ""), " \r\n")),
+        }
+    }
+
+    pub const Commit = struct {
+        parents: []const Oid,
+        /// `Name <email>` of the author line.
+        author: []const u8,
+        /// Committer time (seconds since the epoch).
+        time: i64,
+        message: []const u8,
+    };
+
+    /// A commit's parents, author, time and message.
+    pub fn readCommit(r: *Repo, oid: Oid) !Commit {
+        const raw = switch (r.backend) {
+            .xit => blk: {
+                var rd = try obj.ObjectReader(.git, xopts).init(r.ro(), sys.io, gpa, &oid);
+                defer rd.deinit();
+                if (rd.header().kind != .commit) return sys.fail("{s} is not a commit", .{short(oid)});
+                break :blk try rd.interface.allocRemaining(r.a, .unlimited);
+            },
+            .cli => try r.git(&.{ "cat-file", "commit", &oid }), // git CLI fallback
+        };
+        return parseCommit(r.a, raw);
     }
 
     // ------------------------------------------------------------ worktree moves
@@ -613,6 +660,11 @@ pub const Repo = struct {
 
     /// Fetch `+refs/heads/*:refs/remotes/origin/*` from origin.
     pub fn fetch(r: *Repo) !void {
+        return r.fetchSpecs(&.{"+refs/heads/*:refs/remotes/origin/*"});
+    }
+
+    /// Fetch `refspecs` from origin (refs origin doesn't have are skipped).
+    pub fn fetchSpecs(r: *Repo, refspecs: []const []const u8) !void {
         switch (r.backend) {
             .xit => {
                 var url = try r.remoteUrl();
@@ -621,7 +673,7 @@ pub const Repo = struct {
                     var remote = try xit.net.Remote(.git, xopts).open(r.ro(), sys.io, gpa, "origin");
                     defer remote.deinit(sys.io, gpa);
                     if (cred) |c| try overrideUrl(&remote, try c.url(r.a, url));
-                    xit.net.fetch(.git, xopts, r.rw(), sys.io, gpa, &remote, .{ .refspecs = &.{"+refs/heads/*:refs/remotes/origin/*"} }) catch |e| {
+                    xit.net.fetch(.git, xopts, r.rw(), sys.io, gpa, &remote, .{ .refspecs = refspecs }) catch |e| {
                         if (e == error.HttpUnauthorized and cred == null) {
                             cred = try credential.fill(r.a, url);
                             continue;
@@ -634,7 +686,15 @@ pub const Repo = struct {
                     return;
                 }
             },
-            .cli => _ = r.git(&.{ "fetch", "-q", "origin", "+refs/heads/*:refs/remotes/origin/*" }) catch |e| return sys.context(e, "fetch origin", .{}),
+            // git CLI fallback (which, unlike xit, fails on a ref origin doesn't have)
+            .cli => {
+                var argv: std.ArrayList([]const u8) = .empty;
+                try argv.appendSlice(r.a, &.{ "fetch", "-q", "origin" });
+                try argv.appendSlice(r.a, refspecs);
+                const o = gitOutput(r.a, r.path, argv.items, null) catch |e| return sys.context(e, "fetch origin", .{});
+                if (!o.ok() and std.mem.indexOf(u8, o.stderr, "couldn't find remote ref") == null)
+                    return sys.fail("fetch origin: {s}", .{std.mem.trim(u8, o.stderr, " \r\n")});
+            },
         }
     }
 
@@ -642,6 +702,12 @@ pub const Repo = struct {
     /// like `git push` does.
     pub fn push(r: *Repo, branch: []const u8) !void {
         const spec = try std.fmt.allocPrint(r.a, "refs/heads/{s}:refs/heads/{s}", .{ branch, branch });
+        try r.pushSpec(spec);
+        if (r.localBranchOid(branch) orelse r.headOid()) |h| try r.writeRef(try std.fmt.allocPrint(r.a, "refs/remotes/origin/{s}", .{branch}), h);
+    }
+
+    /// Push one refspec (`src:dst`) to origin.
+    pub fn pushSpec(r: *Repo, spec: []const u8) !void {
         switch (r.backend) {
             .xit => {
                 const url = try r.remoteUrl();
@@ -664,7 +730,6 @@ pub const Repo = struct {
             },
             .cli => _ = r.git(&.{ "push", "-q", "origin", spec }) catch |e| return sys.context(e, "push origin", .{}),
         }
-        if (r.headOid()) |h| try r.writeRef(try std.fmt.allocPrint(r.a, "refs/remotes/origin/{s}", .{branch}), h);
     }
 
     fn remoteUrl(r: *Repo) ![]const u8 {
@@ -719,6 +784,31 @@ pub fn clone(a: Allocator, url: []const u8, dest: []const u8, branch: []const u8
     };
     try r.checkoutBranch(branch);
     return r;
+}
+
+/// Parse a raw commit object (headers, blank line, message).
+pub fn parseCommit(a: Allocator, raw: []const u8) !Repo.Commit {
+    const split = std.mem.indexOf(u8, raw, "\n\n") orelse raw.len;
+    var parents: std.ArrayList(Oid) = .empty;
+    var c: Repo.Commit = .{ .parents = &.{}, .author = "", .time = 0, .message = if (split < raw.len) raw[split + 2 ..] else "" };
+    var it = std.mem.splitScalar(u8, raw[0..split], '\n');
+    while (it.next()) |line| {
+        const sp = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
+        const key = line[0..sp];
+        const val = line[sp + 1 ..];
+        if (std.mem.eql(u8, key, "parent")) {
+            try parents.append(a, try parseOid(val));
+        } else if (std.mem.eql(u8, key, "author")) {
+            const gt = std.mem.lastIndexOfScalar(u8, val, '>') orelse val.len - 1;
+            c.author = val[0 .. gt + 1];
+        } else if (std.mem.eql(u8, key, "committer")) {
+            var parts = std.mem.splitBackwardsScalar(u8, val, ' ');
+            _ = parts.next();
+            c.time = std.fmt.parseInt(i64, parts.next() orelse "0", 10) catch 0;
+        }
+    }
+    c.parents = parents.items;
+    return c;
 }
 
 /// A pathspec as pull routes them: `*` (everything) or a repo-relative path,
@@ -814,6 +904,18 @@ pub fn runGit(a: Allocator, dir: []const u8, args: []const []const u8, stdin: ?[
     const o = gitOutput(a, dir, args, stdin) catch |e| return sys.context(e, "running git", .{});
     if (!o.ok()) return sys.fail("git {s}: {s}", .{ args[0], std.mem.trim(u8, o.stderr, " \r\n") });
     return o.stdout;
+}
+
+test parseCommit {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const p: Oid = @splat('b');
+    const raw = "tree " ++ @as([40]u8, @splat('a')) ++ "\nparent " ++ p ++ "\nauthor jp <j@x> 5 +0000\ncommitter jp <j@x> 7 -0500\ngpgsig -----BEGIN\n \n -----END\n\n{\"id\":1}";
+    const c = try parseCommit(arena.allocator(), raw);
+    try std.testing.expectEqual(@as(usize, 1), c.parents.len);
+    try std.testing.expectEqualStrings("jp <j@x>", c.author);
+    try std.testing.expectEqual(@as(i64, 7), c.time);
+    try std.testing.expectEqualStrings("{\"id\":1}", c.message);
 }
 
 test matchesSpec {

@@ -1,0 +1,11 @@
+.{
+    .name = .pull_haxy,
+    .version = "0.1.0",
+    .fingerprint = 0x2c1bdb8840e00d5,
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .core = .{ .path = "../core" },
+        .git = .{ .path = "../git" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

@@ -13,6 +13,7 @@ const Allocator = std.mem.Allocator;
 const worktree = if (opts.worktree) @import("worktree") else struct {};
 const tool = if (opts.tool) @import("tool") else struct {};
 const env_pkg = if (opts.env) @import("env") else struct {};
+const haxy = if (opts.haxy) @import("haxy") else struct {};
 
 const launchd = if (opts.launchd) @import("launchd.zig") else struct {};
 const mcp = if (opts.mcp) @import("mcp.zig") else struct {};
@@ -175,6 +176,7 @@ fn run(a: Allocator, cmd: cli.Cmd) !void {
                 else => 1,
             });
         },
+        .haxy_sync, .haxy_issues, .haxy_show, .haxy_new, .haxy_comment, .haxy_status, .haxy_open => if (opts.haxy) try haxyCmd(a, root, pf, cmd),
         .each => |argv| {
             var map = try sys.envMap(a);
             for (try ws.env(a, root, pf)) |v| try map.put(v.key, v.value);
@@ -190,6 +192,76 @@ fn run(a: Allocator, cmd: cli.Cmd) !void {
             }
         },
     }
+}
+
+/// `pull haxy ...` (the `haxy` feature).
+fn haxyCmd(a: Allocator, root: []const u8, pf: core.Pullfile, cmd: cli.Cmd) !void {
+    var w: std.Io.Writer.Allocating = .init(a);
+    defer sys.outBytes(w.written());
+    const o = &w.writer;
+    switch (cmd) {
+        .haxy_sync => |names| try haxy.syncAll(a, root, try haxy.select(a, pf, names), try identity(a, root, pf), o),
+        .haxy_issues => |x| {
+            const only: []const []const u8 = if (x.repo) |r| &.{r} else &.{};
+            const repos = try haxy.collect(a, root, try haxy.select(a, pf, only), x.all);
+            if (x.json) return haxy.writeJson(o, root, repos);
+            if (x.repo != null and repos.len == 0) try o.print("{s}: no {s} branch\n", .{ x.repo.?, haxy.BRANCH });
+            try haxy.writeList(o, repos);
+        },
+        .haxy_show => |x| {
+            const repo = try haxyRepo(a, root, pf, x.repo);
+            defer repo.close();
+            try haxy.writeIssue(o, try haxy.find(try haxy.issues(a, repo), x.issue));
+        },
+        .haxy_new => |x| {
+            const repo = try haxyRepo(a, root, pf, x.repo);
+            defer repo.close();
+            const id = try haxy.create(a, repo, try identity(a, root, pf), x.title, x.body, x.labels);
+            try o.print("{s}: opened {s}\n", .{ x.repo, id });
+        },
+        .haxy_comment => |x| {
+            const repo = try haxyRepo(a, root, pf, x.repo);
+            defer repo.close();
+            const issue, const id = try haxy.comment(a, repo, try identity(a, root, pf), x.issue, x.text);
+            try o.print("{s}: commented on {s} ({s})\n", .{ x.repo, issue.id, id });
+        },
+        .haxy_status => |x| {
+            const repo = try haxyRepo(a, root, pf, x.repo);
+            defer repo.close();
+            const status: haxy.Status = if (x.close) .closed else .open;
+            const verb = if (x.close) "closed" else "reopened";
+            if (try haxy.setStatus(a, repo, try identity(a, root, pf), x.issue, status)) |i| {
+                try o.print("{s}: {s} {s}\n", .{ x.repo, verb, i.id });
+            } else try o.print("{s}: {s} is already {s}\n", .{ x.repo, x.issue, @tagName(status) });
+        },
+        .haxy_open => |name| {
+            const repo = try haxyRepo(a, root, pf, name);
+            // haxy's local mode authors events from the repo's user.name/user.email
+            // config, so pin those to pull's identity instead of the global git one.
+            const id = try identity(a, root, pf);
+            try repo.setConfig("user.name", id.name);
+            try repo.setConfig("user.email", id.email);
+            repo.close();
+            var map = try sys.envMap(a);
+            for (try ws.env(a, root, pf)) |v| try map.put(v.key, v.value);
+            const term = sys.runInherit(&.{"haxy"}, .{ .cwd = repo.path, .env = &map }) catch |e|
+                return sys.fail("running haxy: {s}", .{sys.describe(e)});
+            std.process.exit(sys.exitCode(term));
+        },
+        else => unreachable,
+    }
+}
+
+fn haxyRepo(a: Allocator, root: []const u8, pf: core.Pullfile, name: []const u8) !*git.Repo {
+    _ = try haxy.select(a, pf, &.{name});
+    return git.open(a, root, name);
+}
+
+/// The identity commits are written with (`pull whoami`).
+fn identity(a: Allocator, root: []const u8, pf: core.Pullfile) !core.Identity {
+    const id = try core.resolveIdentity(pf, try core.Local.load(a, root));
+    if (pf.identity.require_signing and !id.sign) return sys.fail("pullfile requires signed commits", .{});
+    return id;
 }
 
 /// Left-align in `width` columns (Rust `{:<width}`).
@@ -222,7 +294,7 @@ fn initCmd(a: Allocator, cwd: []const u8, org: ?[]const u8) !void {
 }
 
 fn sync(a: Allocator, root: []const u8, pf: *core.Pullfile, to_upstream: bool) !void {
-    try git.sync(a, root, pf, to_upstream);
+    try git.sync(a, root, pf, to_upstream, ws.fetch_specs);
     try ws.runHook(a, .pull, root, pf.*, try pf.repoNames(), &.{});
 }
 

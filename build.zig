@@ -7,14 +7,15 @@
 //!   zig build -Dfeatures=env,hooks           # a lean pull
 //!   zig build                                # default features
 //!
-//! `mcp` without `launchd` builds the MCP server without its session/job tools.
+//! `mcp` without `launchd` builds the MCP server without its session/job tools, and
+//! without `haxy` without its haxy_* tools.
 const std = @import("std");
 
 /// Every feature this build knows, sorted (also the `features` order printed).
-const all_features = [_][]const u8{ "conventional", "env", "hooks", "https", "ignore", "launchd", "lint", "mcp", "ssh", "tool", "worktree" };
+const all_features = [_][]const u8{ "conventional", "env", "haxy", "hooks", "https", "ignore", "launchd", "lint", "mcp", "ssh", "tool", "worktree" };
 /// Feature packages (pkgs/<name>) compiled in when their feature is on.
-const packages = [_][]const u8{ "env", "hooks", "lint", "ignore", "worktree", "tool", "launchd", "mcp" };
-const default_features = "conventional,env,hooks,https,ignore,launchd,lint,mcp,ssh,tool,worktree";
+const packages = [_][]const u8{ "env", "hooks", "lint", "ignore", "worktree", "tool", "launchd", "haxy", "mcp" };
+const default_features = "conventional,env,haxy,hooks,https,ignore,launchd,lint,mcp,ssh,tool,worktree";
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -60,7 +61,7 @@ pub fn build(b: *std.Build) void {
     for (packages) |p| {
         if (!enabled.contains(p)) continue;
         const dep = (if (std.mem.eql(u8, p, "mcp"))
-            b.lazyDependency(p, .{ .target = target, .optimize = optimize, .sessions = enabled.contains("launchd") })
+            b.lazyDependency(p, .{ .target = target, .optimize = optimize, .sessions = enabled.contains("launchd"), .haxy = enabled.contains("haxy") })
         else
             b.lazyDependency(p, dep_args)) orelse
             std.debug.panic("feature `{s}` needs pkgs/{s} in build.zig.zon", .{ p, p });
