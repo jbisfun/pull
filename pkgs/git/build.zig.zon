@@ -1,0 +1,20 @@
+.{
+    .name = .pull_git,
+    .version = "0.1.0",
+    .fingerprint = 0x697743829ee34eba,
+    .minimum_zig_version = "0.17.1",
+    // vendor/xit = xit-vcs/xit 80eb4a916df4c43f395b3a2895c5427f9aff89d3 (the commit
+    // jbisfun/haxy pins) with two patches, each marked `pull patch`:
+    //   src/object.zig    `writeTree` made pub (pull writes its own GPG-signed commits)
+    //   src/net/http.zig  keep user:password in request URLs (https auth from
+    //                     `git credential fill`)
+    .dependencies = .{
+        .core = .{ .path = "../core" },
+        .xit = .{ .path = "vendor/xit" },
+        .sweep = .{
+            .url = "git+https://github.com/pedronaugusto/sweep#20b14429efbffe8eb1f6b185a85c79fe29939260",
+            .hash = "sweep-0.4.1-6ErwacOHCACjOGrLL7xD_wX8CbOLtowuP5CG1DCGHlfX",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "vendor" },
+}

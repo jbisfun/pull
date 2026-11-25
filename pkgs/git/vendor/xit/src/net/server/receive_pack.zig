@@ -1,0 +1,1040 @@
+const std = @import("std");
+const common = @import("./common.zig");
+const pkt = @import("./pkt.zig");
+
+const rp = @import("../../repo.zig");
+const obj = @import("../../object.zig");
+const pack = @import("../../pack.zig");
+const hash = @import("../../hash.zig");
+const rf = @import("../../ref.zig");
+const work = @import("../../workdir.zig");
+const cfg = @import("../../config.zig");
+const mrg = @import("../../merge.zig");
+
+pub const Options = struct {
+    protocol_version: common.ProtocolVersion = .v0,
+    skip_connectivity_check: bool = false,
+    advertise_refs: bool = false,
+    is_stateless: bool = false,
+    allowed_ref: ?[]const u8 = null,
+    // branch names a push may not delete or move to a commit that doesn't
+    // descend from where it was
+    protected_branches: []const []const u8 = &.{},
+    // branch names a push may not create, move or delete at all
+    locked_branches: []const []const u8 = &.{},
+    pseudo_ref: ?PseudoRef = null,
+    applied_ref_updates: ?*AppliedRefUpdates = null,
+    // keep the final response until the caller's transaction settles
+    deferred_response: ?*Response = null,
+};
+
+// a ref that never exists, whose delete asks the caller to do something. a
+// permitted delete that is the push's only update is reported in
+// `applied_ref_updates` without being applied. anything else done to the ref
+// refuses the whole push.
+pub const PseudoRef = struct {
+    name: []const u8,
+    // whether this push may delete it
+    deletable: bool,
+};
+
+// initialize one response per push and keep it alive through the transaction.
+// after run, send progress while doing extra work, then finish after commit or
+// rollback. pass a failure message if run or the enclosing transaction failed.
+pub const Response = struct {
+    buffer: std.Io.Writer.Allocating,
+    sideband: bool = false,
+    quiet: bool = false,
+
+    pub fn init(allocator: std.mem.Allocator) Response {
+        return .{ .buffer = .init(allocator) };
+    }
+
+    pub fn deinit(self: *Response) void {
+        self.buffer.deinit();
+    }
+
+    pub fn progress(self: *const Response, writer: *std.Io.Writer, text: []const u8) !void {
+        if (!self.sideband or self.quiet) return;
+        try pkt.sendSideband(writer, 2, text);
+        try writer.flush();
+    }
+
+    // call once after the transaction settles. failure discards the buffered
+    // status and sends a fatal sideband error, so no success reaches the client.
+    pub fn finish(self: *Response, writer: *std.Io.Writer, failure: ?[]const u8) !void {
+        if (failure) |message| {
+            if (self.sideband) try pkt.sendSideband(writer, 3, message);
+            try writer.writeAll("0000");
+        } else {
+            try writer.writeAll(self.buffer.written());
+        }
+        try writer.flush();
+    }
+};
+
+pub const AppliedRefUpdate = struct {
+    ref_name: []u8,
+    old_oid: []u8,
+    new_oid: []u8,
+};
+
+pub const AppliedRefUpdates = struct {
+    arena: std.heap.ArenaAllocator,
+    items: std.ArrayList(AppliedRefUpdate) = .empty,
+
+    pub fn init(allocator: std.mem.Allocator) AppliedRefUpdates {
+        return .{ .arena = .init(allocator) };
+    }
+
+    pub fn deinit(self: *AppliedRefUpdates) void {
+        self.arena.deinit();
+    }
+
+    fn append(
+        self: *AppliedRefUpdates,
+        ref_name: []const u8,
+        old_oid: []const u8,
+        new_oid: []const u8,
+    ) !void {
+        const allocator = self.arena.allocator();
+        try self.items.append(allocator, .{
+            .ref_name = try allocator.dupe(u8, ref_name),
+            .old_oid = try allocator.dupe(u8, old_oid),
+            .new_oid = try allocator.dupe(u8, new_oid),
+        });
+    }
+};
+
+fn reportProgress(
+    comptime repo_kind: rp.RepoKind,
+    comptime repo_opts: rp.RepoOpts(repo_kind),
+    io: std.Io,
+    progress_ctx_maybe: ?repo_opts.ProgressCtx,
+    event: rp.ProgressEvent,
+) !void {
+    if (repo_opts.ProgressCtx == void) return;
+    const progress_ctx = progress_ctx_maybe orelse return;
+    try progress_ctx.run(io, event);
+}
+
+pub fn run(
+    comptime repo_kind: rp.RepoKind,
+    comptime repo_opts: rp.RepoOpts(repo_kind),
+    state: rp.Repo(repo_kind, repo_opts).State(.read_write),
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    reader: *std.Io.Reader,
+    writer: *std.Io.Writer,
+    options: Options,
+    progress_ctx_maybe: ?repo_opts.ProgressCtx,
+) !void {
+    // pkt-line writes are buffered, so make sure any error message
+    // is sent before an error unwinds past this point
+    errdefer writer.flush() catch {};
+
+    var receive_pack = ReceivePack{ .protected_branches = options.protected_branches, .locked_branches = options.locked_branches };
+
+    try receive_pack.readConfig(repo_kind, repo_opts, state.readOnly(), io, allocator);
+
+    if (options.advertise_refs or !options.is_stateless) {
+        try receive_pack.advertiseRefs(repo_kind, repo_opts, state.readOnly(), io, allocator, writer, options.protocol_version);
+    }
+    if (options.advertise_refs) return;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const ref_updates = try receive_pack.readRefUpdates(repo_opts.hash, &arena, reader);
+    const response_writer = if (options.deferred_response) |response| blk: {
+        response.sideband = receive_pack.use_sideband;
+        response.quiet = receive_pack.quiet;
+        break :blk &response.buffer.writer;
+    } else writer;
+
+    var transaction_failure = false;
+
+    if (ref_updates.items.len != 0) {
+        if (options.allowed_ref) |allowed_ref| {
+            var disallowed = false;
+            for (ref_updates.items) |*update| {
+                if (!std.mem.eql(u8, update.ref_name, allowed_ref)) {
+                    update.error_message = "ref update not allowed";
+                    disallowed = true;
+                }
+            }
+            if (disallowed) {
+                transaction_failure = true;
+                for (ref_updates.items) |*update| {
+                    if (update.error_message == null) update.error_message = "atomic transaction failed";
+                }
+            }
+        }
+
+        if (options.pseudo_ref) |pseudo_ref| {
+            var refused = false;
+            for (ref_updates.items) |*update| {
+                if (update.error_message != null or !std.mem.eql(u8, update.ref_name, pseudo_ref.name)) continue;
+                update.error_message = if (!isNullOid(&update.new_oid))
+                    "can only be deleted"
+                else if (!pseudo_ref.deletable)
+                    "deletion prohibited"
+                else if (ref_updates.items.len != 1)
+                    "must be deleted alone"
+                else
+                    null;
+                // the caller acts on the delete, so there is no ref to apply it to
+                update.skip_update = true;
+                if (update.error_message != null) refused = true;
+            }
+            if (refused) {
+                transaction_failure = true;
+                for (ref_updates.items) |*update| {
+                    if (update.error_message == null) update.error_message = "atomic transaction failed";
+                }
+            }
+        }
+
+        // the xit backend checks connectivity here, over what the pack stored
+        // and the new tips. anything missing cancels the whole push, so no
+        // object with a missing closure is ever stored.
+        var missing_objects = false;
+        {
+            const delete_only = for (ref_updates.items) |update| {
+                if (!isNullOid(&update.new_oid)) break false;
+            } else true;
+
+            if (!delete_only) {
+                var counting_buf: [repo_opts.buffer_size]u8 = undefined;
+                var counting_reader = pack.CountingReader.init(reader, &counting_buf);
+                var pack_reader = pack.PackReader.initStream(&counting_reader);
+                defer pack_reader.deinit();
+
+                var pack_iter = try pack.PackIterator(repo_kind, repo_opts).init(io, allocator, &pack_reader);
+
+                if (.git == repo_kind or options.skip_connectivity_check) {
+                    try obj.copyFromPackIterator(repo_kind, repo_opts, state, io, allocator, &pack_iter, progress_ctx_maybe, false);
+                } else {
+                    obj.copyFromPackIterator(repo_kind, repo_opts, state, io, allocator, &pack_iter, progress_ctx_maybe, true) catch |err| switch (err) {
+                        error.MissingNecessaryObjects => missing_objects = true,
+                        else => |e| return e,
+                    };
+                    if (!missing_objects) missing_objects = for (ref_updates.items) |*update| {
+                        if (isNullOid(&update.new_oid) or update.skip_update) continue;
+                        if (!try obj.isStored(repo_opts, state.readOnly(), &update.new_oid)) break true;
+                    } else false;
+                }
+            }
+        }
+
+        if (missing_objects) {
+            transaction_failure = true;
+            for (ref_updates.items) |*update| {
+                if (update.error_message == null) {
+                    update.error_message = if (isNullOid(&update.new_oid)) "atomic transaction failed" else "missing necessary objects";
+                }
+            }
+        } else {
+            try receive_pack.executeRefUpdates(writer, repo_kind, repo_opts, state, io, allocator, ref_updates.items, options, progress_ctx_maybe);
+        }
+
+        // an atomic push applies every ref update or none of them, so if any
+        // of them failed, the rest must be reported as failed as well
+        if (.xit == repo_kind and receive_pack.atomic) {
+            const atomic_failure = for (ref_updates.items) |update| {
+                if (update.error_message != null) break true;
+            } else false;
+
+            if (atomic_failure) {
+                transaction_failure = true;
+                for (ref_updates.items) |*update| {
+                    if (update.error_message == null) {
+                        update.error_message = "atomic transaction failed";
+                    }
+                }
+            }
+        }
+
+        if (receive_pack.report_status_v2 or receive_pack.report_status) {
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(allocator);
+
+            try pkt.bufPktLineFmt(&buf, allocator, "unpack {s}\n", .{"ok"});
+
+            for (ref_updates.items) |update| {
+                if (update.error_message) |err_msg| {
+                    try pkt.bufPktLineFmt(&buf, allocator, "ng {s} {s}\n", .{ update.ref_name, err_msg });
+                } else {
+                    try pkt.bufPktLineFmt(&buf, allocator, "ok {s}\n", .{update.ref_name});
+                }
+            }
+            try pkt.bufPktFlush(&buf, allocator);
+
+            try pkt.sendSideband(response_writer, 1, buf.items);
+        }
+    }
+
+    try response_writer.writeAll("0000");
+
+    if (transaction_failure) return error.CancelTransaction;
+
+    if (options.applied_ref_updates) |updates| {
+        for (ref_updates.items) |update| {
+            const pseudo = if (options.pseudo_ref) |pseudo_ref| std.mem.eql(u8, update.ref_name, pseudo_ref.name) else false;
+            if (update.error_message != null or (update.skip_update and !pseudo)) continue;
+            try updates.append(update.ref_name, &update.old_oid, &update.new_oid);
+        }
+    }
+}
+
+// advertise the refs and nothing else. it only reads, so it needs no write
+// transaction: a server can send it, wait for the client's commands, and only
+// then call `run` with `is_stateless` set.
+pub fn advertise(
+    comptime repo_kind: rp.RepoKind,
+    comptime repo_opts: rp.RepoOpts(repo_kind),
+    state: rp.Repo(repo_kind, repo_opts).State(.read_only),
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    options: Options,
+) !void {
+    var receive_pack: ReceivePack = .{};
+    try receive_pack.readConfig(repo_kind, repo_opts, state, io, allocator);
+    try receive_pack.advertiseRefs(repo_kind, repo_opts, state, io, allocator, writer, options.protocol_version);
+}
+
+// advertise a repo that doesn't exist yet. the dummy line is sha1-width so
+// clients without object-format support still parse it, and listing every
+// hash kind lets a newer client name its own in its first command.
+pub fn advertiseUncreated(
+    comptime repo_kind: rp.RepoKind,
+    writer: *std.Io.Writer,
+    options: Options,
+) !void {
+    if (options.protocol_version == .v1) {
+        try pkt.writePktLineFmt(writer, "version 1\n", .{});
+    }
+
+    const defaults: ReceivePack = .{};
+    var line_buf: [pkt.LARGE_PACKET_MAX]u8 = undefined;
+    var line: std.Io.Writer = .fixed(&line_buf);
+    const null_oid: [hash.hexLen(.sha1)]u8 = @splat('0');
+    try line.writeAll(&null_oid ++ " capabilities^{}");
+    try line.writeByte(0);
+    try writeCapabilities(repo_kind, &line, defaults.prefer_ofs_delta);
+    try line.print(" object-format={s} object-format={s}\n", .{ common.hashName(.sha1), common.hashName(.sha256) });
+    try pkt.writePktLine(writer, line.buffered());
+    try pkt.writePktFlush(writer);
+}
+
+// peek the client's first command without consuming it and return the hash
+// kind it names (sha1 when it names none). null means the client sent no
+// commands, so nothing should be created.
+pub fn peekObjectFormat(reader: *std.Io.Reader) !?hash.HashKind {
+    const header = reader.peekArray(pkt.PKT_LEN_SIZE) catch |err| switch (err) {
+        error.EndOfStream => return null,
+        else => |e| return e,
+    };
+    const len = std.fmt.parseInt(usize, header, 16) catch return error.InvalidPktLineHeader;
+    if (len == 0) return null;
+    if (len < pkt.PKT_LEN_SIZE) return error.InvalidPktLineLength;
+    if (len > reader.buffer.len) return error.PktLineTooLong;
+
+    const line = (try reader.peek(len))[pkt.PKT_LEN_SIZE..];
+    const null_pos = std.mem.findScalar(u8, line, 0) orelse return .sha1;
+    const features = std.mem.trim(u8, line[null_pos + 1 ..], " \r\n");
+    const format = common.getFeatureValue(features, "object-format") orelse return .sha1;
+    return std.meta.stringToEnum(hash.HashKind, format) orelse error.UnsupportedObjectFormat;
+}
+
+fn writeCapabilities(comptime repo_kind: rp.RepoKind, writer: *std.Io.Writer, prefer_ofs_delta: bool) !void {
+    try writer.writeAll("report-status report-status-v2 delete-refs side-band-64k quiet");
+    // only the xit backend can roll back a partially applied push
+    if (.xit == repo_kind) {
+        try writer.writeAll(" atomic");
+    }
+    if (prefer_ofs_delta) {
+        try writer.writeAll(" ofs-delta");
+    }
+}
+
+const ReceivePack = struct {
+    // config
+    prefer_ofs_delta: bool = true,
+    is_bare: bool = false,
+    deny_deletes: bool = false,
+    deny_non_fast_forwards: bool = false,
+    deny_current_branch: Deny = .unconfigured,
+    deny_delete_current: Deny = .unconfigured,
+
+    // options
+    protected_branches: []const []const u8 = &.{},
+    locked_branches: []const []const u8 = &.{},
+
+    // protocol state
+    sent_capabilities: bool = false,
+    use_sideband: bool = false,
+    quiet: bool = false,
+    atomic: bool = false,
+    report_status: bool = false,
+    report_status_v2: bool = false,
+    head_name: ?[]const u8 = null,
+
+    fn readConfig(self: *ReceivePack, comptime repo_kind: rp.RepoKind, comptime repo_opts: rp.RepoOpts(repo_kind), state: rp.Repo(repo_kind, repo_opts).State(.read_only), io: std.Io, allocator: std.mem.Allocator) !void {
+        var config = try cfg.Config(repo_kind, repo_opts).init(state, io, allocator);
+        defer config.deinit();
+
+        if (config.sections.get("receive")) |vars| {
+            if (vars.get("denydeletes")) |v| {
+                self.deny_deletes = cfg.parseBool(v);
+            }
+            if (vars.get("denynonfastforwards")) |v| {
+                self.deny_non_fast_forwards = cfg.parseBool(v);
+            }
+            if (vars.get("denycurrentbranch")) |v| {
+                self.deny_current_branch = Deny.parse(v);
+            }
+            if (vars.get("denydeletecurrent")) |v| {
+                self.deny_delete_current = Deny.parse(v);
+            }
+        }
+        if (config.sections.get("repack")) |vars| {
+            if (vars.get("usedeltabaseoffset")) |v| {
+                self.prefer_ofs_delta = cfg.parseBool(v);
+            }
+        }
+        self.is_bare = try state.isBare(io, allocator);
+    }
+
+    fn advertiseRef(
+        self: *ReceivePack,
+        comptime repo_kind: rp.RepoKind,
+        comptime repo_opts: rp.RepoOpts(repo_kind),
+        writer: *std.Io.Writer,
+        path: []const u8,
+        oid: *const [hash.hexLen(repo_opts.hash)]u8,
+    ) !void {
+        if (self.sent_capabilities) {
+            try pkt.writePktLineFmt(writer, "{s} {s}\n", .{ oid, path });
+        } else {
+            var line_buf: [pkt.LARGE_PACKET_MAX]u8 = undefined;
+            var line: std.Io.Writer = .fixed(&line_buf);
+            try line.print("{s} {s}", .{ oid, path });
+            try line.writeByte(0);
+            try writeCapabilities(repo_kind, &line, self.prefer_ofs_delta);
+            try line.print(" object-format={s}\n", .{common.hashName(repo_opts.hash)});
+            try pkt.writePktLine(writer, line.buffered());
+            self.sent_capabilities = true;
+        }
+    }
+
+    fn advertiseRefs(
+        self: *ReceivePack,
+        comptime repo_kind: rp.RepoKind,
+        comptime repo_opts: rp.RepoOpts(repo_kind),
+        state: rp.Repo(repo_kind, repo_opts).State(.read_only),
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+        protocol_version: common.ProtocolVersion,
+    ) !void {
+        if (protocol_version == .v1) {
+            try pkt.writePktLineFmt(writer, "version 1\n", .{});
+        }
+
+        // head
+        if (try rf.readHeadRecurMaybe(repo_kind, repo_opts, state, io)) |*head_oid| {
+            try self.advertiseRef(repo_kind, repo_opts, writer, "HEAD", head_oid);
+        }
+
+        // heads and tags
+        for ([_]rf.RefKind{ .head, .tag }) |ref_kind| {
+            var iter = try rf.RefIterator(repo_kind, repo_opts).init(state, io, allocator, ref_kind, .beginning);
+            defer iter.deinit();
+
+            while (try iter.next()) |ref| {
+                if (try rf.readRecur(repo_kind, repo_opts, state, io, .{ .ref = ref })) |*oid| {
+                    var path_buf: [rf.MAX_REF_CONTENT_SIZE]u8 = @splat(0);
+                    const ref_path = try ref.toPath(&path_buf);
+                    try self.advertiseRef(repo_kind, repo_opts, writer, ref_path, oid);
+                }
+            }
+        }
+
+        if (!self.sent_capabilities) {
+            const null_oid: [hash.hexLen(repo_opts.hash)]u8 = @splat('0');
+            try self.advertiseRef(repo_kind, repo_opts, writer, "capabilities^{}", &null_oid);
+        }
+
+        try pkt.writePktFlush(writer);
+    }
+
+    fn readRefUpdates(
+        self: *ReceivePack,
+        comptime hash_kind: hash.HashKind,
+        arena: *std.heap.ArenaAllocator,
+        reader: *std.Io.Reader,
+    ) !std.ArrayList(RefUpdate(hash_kind)) {
+        const hex_len = comptime hash.hexLen(hash_kind);
+
+        var ref_updates: std.ArrayList(RefUpdate(hash_kind)) = .empty;
+        while (true) {
+            var buf: [pkt.LARGE_PACKET_MAX]u8 = undefined;
+            const line = switch (try pkt.readPktLineEx(reader, &buf)) {
+                .data => |data| data,
+                .flush => break,
+                // a client that hangs up before sending a command has nothing to push
+                .eof => if (ref_updates.items.len == 0) break else return error.UnexpectedEof,
+                .delim => return error.UnexpectedDelim,
+                .response_end => return error.UnexpectedResponseEnd,
+            };
+
+            const null_pos = std.mem.findScalar(u8, line, 0);
+            const line_data = if (null_pos) |pos| line[0..pos] else line;
+
+            const features = if (null_pos) |pos| std.mem.trim(u8, line[pos + 1 ..], " \r\n") else "";
+
+            if (common.hasFeature(features, "report-status")) {
+                self.report_status = true;
+            }
+            if (common.hasFeature(features, "report-status-v2")) {
+                self.report_status_v2 = true;
+            }
+            if (common.hasFeature(features, "side-band-64k")) {
+                self.use_sideband = true;
+            }
+            if (common.hasFeature(features, "quiet")) self.quiet = true;
+            if (common.hasFeature(features, "atomic")) {
+                self.atomic = true;
+            }
+
+            if (ref_updates.items.len == 0) {
+                const format = common.getFeatureValue(features, "object-format") orelse "sha1";
+                if (!std.mem.eql(u8, format, common.hashName(hash_kind))) return error.ObjectFormatMismatch;
+            }
+
+            // parse "<old_oid> <new_oid> <refname>" and append
+            {
+                if (line_data.len < hex_len + 1 + hex_len + 1) return error.QueueRefUpdateError;
+
+                const old_oid = line_data[0..hex_len].*;
+                if (line_data[hex_len] != ' ') return error.QueueRefUpdateError;
+
+                const new_oid = line_data[hex_len + 1 ..][0..hex_len].*;
+                if (line_data[hex_len + 1 + hex_len] != ' ') return error.QueueRefUpdateError;
+
+                const ref_data = line_data[hex_len + 1 + hex_len + 1 ..];
+
+                try ref_updates.append(arena.allocator(), .{
+                    .error_message = null,
+                    .skip_update = false,
+                    .old_oid = old_oid,
+                    .new_oid = new_oid,
+                    .ref_name = try arena.allocator().dupe(u8, ref_data),
+                });
+            }
+        }
+
+        // capabilities (including side-band) only ride along on the first ref
+        // update command, so an up-to-date push sends none and needs no sideband
+        if (ref_updates.items.len != 0 and !self.use_sideband) return error.SidebandProtocolRequired;
+
+        return ref_updates;
+    }
+
+    fn executeRefUpdates(
+        self: *ReceivePack,
+        writer: *std.Io.Writer,
+        comptime repo_kind: rp.RepoKind,
+        comptime repo_opts: rp.RepoOpts(repo_kind),
+        state: rp.Repo(repo_kind, repo_opts).State(.read_write),
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        ref_updates: []RefUpdate(repo_opts.hash),
+        options: Options,
+        progress_ctx_maybe: ?repo_opts.ProgressCtx,
+    ) !void {
+        // a delete-only push has no new objects to check, and collecting the
+        // verified commits below is not free
+        const has_new_oids = for (ref_updates) |*update| {
+            if (!isNullOid(&update.new_oid) and !update.skip_update) break true;
+        } else false;
+
+        // the xit backend checked connectivity as the pack was stored
+        if (.git == repo_kind and !options.skip_connectivity_check and has_new_oids) {
+            // what a check walks is not known until it has walked it
+            try reportProgress(repo_kind, repo_opts, io, progress_ctx_maybe, .{ .start = .{ .kind = .checking_object, .estimated_total_items = 0 } });
+            const all_connected = blk: {
+                var obj_iter = try obj.ObjectIterator(repo_kind, repo_opts).init(
+                    state.readOnly(),
+                    io,
+                    allocator,
+                    .{ .kind = .all },
+                );
+                defer obj_iter.deinit();
+
+                try markVerifiedCommits(repo_kind, repo_opts, state.readOnly(), io, allocator, &obj_iter, progress_ctx_maybe);
+
+                for (ref_updates) |*update| {
+                    if (!isNullOid(&update.new_oid) and !update.skip_update) {
+                        try obj_iter.include(&update.new_oid);
+                    }
+                }
+
+                while (true) {
+                    const maybe_obj = obj_iter.next(allocator) catch |err| switch (err) {
+                        error.ObjectNotFound => break :blk false,
+                        else => return err,
+                    };
+                    const next_obj = maybe_obj orelse break;
+                    next_obj.deinit();
+                    try reportProgress(repo_kind, repo_opts, io, progress_ctx_maybe, .{ .complete_one = .checking_object });
+                }
+                break :blk true;
+            };
+            try reportProgress(repo_kind, repo_opts, io, progress_ctx_maybe, .{ .end = .checking_object });
+
+            if (!all_connected) {
+                for (ref_updates) |*update| {
+                    if (isNullOid(&update.new_oid)) continue;
+
+                    const connected = per_update: {
+                        var obj_iter = try obj.ObjectIterator(repo_kind, repo_opts).init(
+                            state.readOnly(),
+                            io,
+                            allocator,
+                            .{ .kind = .all },
+                        );
+                        defer obj_iter.deinit();
+
+                        try markVerifiedCommits(repo_kind, repo_opts, state.readOnly(), io, allocator, &obj_iter, null);
+
+                        try obj_iter.include(&update.new_oid);
+
+                        while (true) {
+                            const maybe_obj = obj_iter.next(allocator) catch |err| switch (err) {
+                                error.ObjectNotFound => break :per_update false,
+                                else => return err,
+                            };
+                            const next_obj = maybe_obj orelse break;
+                            next_obj.deinit();
+                        }
+                        break :per_update true;
+                    };
+
+                    if (!connected) {
+                        update.error_message = "missing necessary objects";
+                    }
+                }
+            }
+        }
+
+        // skip if all ref updates already have errors
+        {
+            for (ref_updates) |update| {
+                if (update.error_message == null) break;
+            } else return;
+        }
+
+        // detect conflicting symref updates
+        {
+            var ref_list = std.StringHashMap(usize).init(allocator);
+            defer ref_list.deinit();
+
+            for (ref_updates, 0..) |*update, i| {
+                try ref_list.put(update.ref_name, i);
+            }
+
+            for (ref_updates) |*update| {
+                if (update.error_message == null) {
+                    blk: {
+                        // the name comes from the client, so it may not be a
+                        // ref at all. applyRefUpdate will reject it below.
+                        if (rf.Ref.initFromPath(update.ref_name, null) == null) break :blk;
+
+                        var read_buf: [rf.MAX_REF_CONTENT_SIZE]u8 = undefined;
+                        const ref_or_oid = rf.read(repo_kind, repo_opts, state.readOnly(), io, update.ref_name, &read_buf) catch |err| switch (err) {
+                            error.RefNotFound => break :blk,
+                            else => |e| return e,
+                        };
+
+                        // only symrefs can alias
+                        const target_ref = switch (ref_or_oid orelse break :blk) {
+                            .ref => |ref| ref,
+                            .oid => break :blk,
+                        };
+
+                        var dst_path_buf: [rf.MAX_REF_CONTENT_SIZE]u8 = undefined;
+                        const dst_name = try target_ref.toPath(&dst_path_buf);
+
+                        const dst_index = ref_list.get(dst_name) orelse
+                            break :blk;
+                        const dst_update = &ref_updates[dst_index];
+
+                        update.skip_update = true;
+
+                        if (std.mem.eql(u8, &update.old_oid, &dst_update.old_oid) and
+                            std.mem.eql(u8, &update.new_oid, &dst_update.new_oid)) break :blk;
+
+                        dst_update.skip_update = true;
+
+                        const abbrev: usize = 7;
+                        try writeError(
+                            writer,
+                            "refusing inconsistent update between symref '{s}' ({s}..{s}) and its target '{s}' ({s}..{s})",
+                            .{
+                                update.ref_name,
+                                update.old_oid[0..abbrev],
+                                update.new_oid[0..abbrev],
+                                dst_update.ref_name,
+                                dst_update.old_oid[0..abbrev],
+                                dst_update.new_oid[0..abbrev],
+                            },
+                        );
+
+                        update.error_message = "inconsistent aliased update";
+                        dst_update.error_message = update.error_message;
+                    }
+                }
+            }
+        }
+
+        var head_read_buf: [rf.MAX_REF_CONTENT_SIZE]u8 = undefined;
+        var head_path_buf: [rf.MAX_REF_CONTENT_SIZE]u8 = undefined;
+        // a bare repo has no checked out branch, but its HEAD still names the
+        // default branch, which must not be deleted
+        self.head_name = blk: {
+            const ref_or_oid = rf.read(repo_kind, repo_opts, state.readOnly(), io, "HEAD", &head_read_buf) catch |err| switch (err) {
+                error.RefNotFound => break :blk null,
+                else => |e| return e,
+            };
+            const target_ref = switch (ref_or_oid orelse break :blk null) {
+                .ref => |ref| ref,
+                .oid => break :blk null,
+            };
+            break :blk try target_ref.toPath(&head_path_buf);
+        };
+
+        if (.xit == repo_kind and self.atomic) {
+            // validate the whole transaction, including updateInstead's
+            // worktree check, before changing any ref or filesystem entry.
+            for (ref_updates) |*update| {
+                if (update.error_message != null or update.skip_update) continue;
+                update.error_message = try self.applyRefUpdate(writer, repo_kind, repo_opts, state, io, allocator, update, true);
+            }
+
+            for (ref_updates) |update| {
+                if (update.error_message != null) return;
+            }
+
+            // apply the checked-out branch last. if another ref write fails,
+            // the transaction can still abort without touching the worktree.
+            for (ref_updates) |*update| {
+                if (update.error_message != null or update.skip_update or self.isHeadUpdate(repo_opts.hash, update)) continue;
+                update.error_message = try self.applyRefUpdate(writer, repo_kind, repo_opts, state, io, allocator, update, false);
+            }
+
+            for (ref_updates) |update| {
+                if (update.error_message != null) return;
+            }
+            for (ref_updates) |*update| {
+                if (update.error_message != null or update.skip_update or !self.isHeadUpdate(repo_opts.hash, update)) continue;
+                update.error_message = try self.applyRefUpdate(writer, repo_kind, repo_opts, state, io, allocator, update, false);
+            }
+        } else {
+            for (ref_updates) |*update| {
+                if (update.error_message != null or update.skip_update) continue;
+                update.error_message = try self.applyRefUpdate(writer, repo_kind, repo_opts, state, io, allocator, update, false);
+            }
+        }
+    }
+
+    // the branch `ref_name` names when it is one of `branches`
+    fn listedBranch(branches: []const []const u8, ref_name: []const u8) ?[]const u8 {
+        if (!std.mem.startsWith(u8, ref_name, "refs/heads/")) return null;
+        const branch = ref_name["refs/heads/".len..];
+        for (branches) |listed| {
+            if (std.mem.eql(u8, branch, listed)) return branch;
+        }
+        return null;
+    }
+
+    fn isHeadUpdate(
+        self: *const ReceivePack,
+        comptime hash_kind: hash.HashKind,
+        ref_update: *const RefUpdate(hash_kind),
+    ) bool {
+        const head_name = self.head_name orelse return false;
+        return std.mem.eql(u8, ref_update.ref_name, head_name);
+    }
+
+    fn applyRefUpdate(
+        self: *ReceivePack,
+        writer: *std.Io.Writer,
+        comptime repo_kind: rp.RepoKind,
+        comptime repo_opts: rp.RepoOpts(repo_kind),
+        state: rp.Repo(repo_kind, repo_opts).State(.read_write),
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        ref_update: *RefUpdate(repo_opts.hash),
+        dry_run: bool,
+    ) !?[]const u8 {
+        const name = ref_update.ref_name;
+
+        const is_funny_ref = if (std.mem.startsWith(u8, name, "refs/")) blk: {
+            const name_after_refs = name["refs/".len..];
+            break :blk !rf.validateName(name_after_refs) or
+                (!isNullOid(&ref_update.new_oid) and std.mem.findScalar(u8, name_after_refs, '/') == null) or
+                // a name that doesn't parse as a ref can't be read or written
+                rf.Ref.initFromPath(name, null) == null;
+        } else true;
+
+        if (is_funny_ref) {
+            try writeError(writer, "refusing to update funny ref '{s}' remotely", .{name});
+            return "funny refname";
+        }
+
+        // ahead of the stale check, so a stale push learns it can never land
+        if (listedBranch(self.locked_branches, name)) |branch| {
+            try writeError(writer, "refusing to update {s}, which you may not push to directly", .{branch});
+            return "branch locked";
+        }
+
+        // the ref must still point at the old oid the client sent, so a stale
+        // or concurrent push can't clobber an update it never saw. a ref that
+        // doesn't exist reads as the null oid, which is what a create sends.
+        {
+            const ref = rf.Ref.initFromPath(name, null) orelse return "funny refname";
+            const null_oid: [hash.hexLen(repo_opts.hash)]u8 = @splat('0');
+            const current_oid = try rf.readRecur(repo_kind, repo_opts, state.readOnly(), io, .{ .ref = ref }) orelse null_oid;
+            if (!std.mem.eql(u8, &current_oid, &ref_update.old_oid)) {
+                if (isNullOid(&ref_update.old_oid)) {
+                    try writeError(writer, "refusing to create '{s}', which already exists", .{name});
+                    return "already exists";
+                }
+                try writeError(writer, "refusing to update '{s}', which has changed since you last fetched", .{name});
+                return "stale info";
+            }
+        }
+
+        var should_update_worktree = false;
+
+        if (self.head_name) |head_name| {
+            if (!self.is_bare and std.mem.eql(u8, name, head_name)) {
+                switch (self.deny_current_branch) {
+                    .ignore => {},
+                    .warn => if (!dry_run) try writeWarning(writer, "updating the current branch", .{}),
+                    .refuse => {
+                        try writeError(writer, "refusing to update checked out branch: {s}", .{name});
+                        return "branch is currently checked out";
+                    },
+                    .unconfigured, .update_instead => {
+                        should_update_worktree = true;
+                    },
+                }
+            }
+        }
+
+        if (!isNullOid(&ref_update.new_oid)) {
+            var object_reader_or_err = obj.ObjectReader(repo_kind, repo_opts).init(state.readOnly(), io, allocator, &ref_update.new_oid);
+            if (object_reader_or_err) |*object_reader| {
+                object_reader.deinit();
+            } else |err| switch (err) {
+                error.ObjectNotFound => return "bad pack",
+                else => |e| return e,
+            }
+        }
+
+        const protected_branch = listedBranch(self.protected_branches, name);
+
+        if (!isNullOid(&ref_update.old_oid) and isNullOid(&ref_update.new_oid)) {
+            if (protected_branch) |branch| {
+                try writeError(writer, "refusing to delete protected branch {s}", .{branch});
+                return "protected branch";
+            }
+            if (self.deny_deletes and std.mem.startsWith(u8, name, "refs/heads/")) {
+                try writeError(writer, "denying ref deletion for {s}", .{name});
+                return "deletion prohibited";
+            }
+
+            if (self.head_name) |head_name| {
+                if (std.mem.eql(u8, name, head_name)) {
+                    switch (self.deny_delete_current) {
+                        .ignore => {},
+                        .warn => if (!dry_run) try writeWarning(writer, "deleting the current branch", .{}),
+                        .refuse, .unconfigured, .update_instead => {
+                            if (self.deny_delete_current == .unconfigured) {
+                                try writeError(writer, deny_delete_current_msg, .{});
+                            }
+                            try writeError(writer, "refusing to delete the current branch: {s}", .{name});
+                            return "deletion of the current branch prohibited";
+                        },
+                    }
+                }
+            }
+        }
+
+        if ((protected_branch != null or (self.deny_non_fast_forwards and std.mem.startsWith(u8, name, "refs/heads/"))) and
+            !isNullOid(&ref_update.new_oid) and
+            !isNullOid(&ref_update.old_oid))
+        {
+            const fast_forward = if (mrg.getDescendent(repo_kind, repo_opts, state.readOnly(), io, allocator, &ref_update.old_oid, &ref_update.new_oid)) |descendent|
+                std.mem.eql(u8, &descendent, &ref_update.new_oid)
+            else |err| switch (err) {
+                error.DescendentNotFound => false,
+                else => |e| return e,
+            };
+
+            if (!fast_forward) {
+                if (protected_branch) |branch| {
+                    try writeError(writer, "refusing to force push to protected branch {s}", .{branch});
+                    return "protected branch";
+                }
+                try writeError(writer, "denying non-fast-forward {s} (you should pull first)", .{name});
+                return "non-fast-forward";
+            }
+        }
+
+        if (should_update_worktree) {
+            var res = try work.Switch(repo_kind, repo_opts).init(state, io, allocator, .{
+                .kind = .reset,
+                .target = .{ .oid = &ref_update.new_oid },
+                .dry_run = dry_run,
+            });
+            defer res.deinit();
+
+            if (.conflict == res.result) {
+                try writeError(writer, "refusing to update checked out branch: worktree contains local changes", .{});
+                return "working directory has unstaged changes";
+            }
+        }
+
+        if (dry_run) return null;
+
+        if (isNullOid(&ref_update.new_oid)) {
+            rf.remove(repo_kind, repo_opts, state, io, name) catch |err| switch (err) {
+                error.RefNotFound => return "deletion of non-existent ref",
+                else => |e| return e,
+            };
+        } else {
+            try rf.write(repo_kind, repo_opts, state, io, name, .{ .oid = &ref_update.new_oid });
+        }
+
+        return null;
+    }
+};
+
+const Deny = enum {
+    unconfigured,
+    ignore,
+    warn,
+    refuse,
+    update_instead,
+
+    fn parse(value: []const u8) Deny {
+        if (std.ascii.eqlIgnoreCase(value, "ignore")) return .ignore;
+        if (std.ascii.eqlIgnoreCase(value, "warn")) return .warn;
+        if (std.ascii.eqlIgnoreCase(value, "refuse")) return .refuse;
+        if (std.ascii.eqlIgnoreCase(value, "updateinstead")) return .update_instead;
+        if (cfg.parseBool(value)) return .refuse;
+        return .ignore;
+    }
+};
+
+fn writeMessage(writer: *std.Io.Writer, comptime prefix: [:0]const u8, comptime err: [:0]const u8, params: anytype) !void {
+    // the params can include client-supplied ref names, which are far
+    // bigger than this buffer, so the message is truncated if it overflows.
+    // the last byte is reserved so the newline can always be written.
+    var buffer: [4096]u8 = @splat(0);
+    var fixed: std.Io.Writer = .fixed(buffer[0 .. buffer.len - 1]);
+
+    fixed.print(prefix ++ err ++ "\n", params) catch {};
+
+    var len = fixed.buffered().len;
+    if (len == 0 or buffer[len - 1] != '\n') {
+        buffer[len] = '\n';
+        len += 1;
+    }
+
+    try pkt.sendSideband(writer, 2, buffer[0..len]);
+}
+
+fn writeWarning(writer: *std.Io.Writer, comptime err: [:0]const u8, params: anytype) !void {
+    try writeMessage(writer, "warning: ", err, params);
+}
+
+fn writeError(writer: *std.Io.Writer, comptime err: [:0]const u8, params: anytype) !void {
+    try writeMessage(writer, "error: ", err, params);
+}
+
+fn RefUpdate(comptime hash_kind: hash.HashKind) type {
+    const hex_len = hash.hexLen(hash_kind);
+    return struct {
+        error_message: ?[]const u8,
+        skip_update: bool,
+        old_oid: [hex_len]u8,
+        new_oid: [hex_len]u8,
+        ref_name: []u8,
+    };
+}
+
+fn isNullOid(oid: []const u8) bool {
+    return std.mem.allEqual(u8, oid, '0');
+}
+
+// the git backend can hold objects with missing closures, but every commit
+// already reachable from a ref had its objects verified by the push that
+// brought it in, so a connectivity check can stop as soon as it reaches one
+// instead of walking the repo's whole history again. marking them
+// in the iterator's seen set is what makes it stop; `exclude` would descend
+// into each commit's whole subtree and cost as much as it saves. only commits
+// are walked here, which is an order of magnitude cheaper than walking every
+// tree and blob, and stopping at a commit skips its content anyway.
+fn markVerifiedCommits(
+    comptime repo_kind: rp.RepoKind,
+    comptime repo_opts: rp.RepoOpts(repo_kind),
+    state: rp.Repo(repo_kind, repo_opts).State(.read_only),
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    obj_iter: *obj.ObjectIterator(repo_kind, repo_opts),
+    progress_ctx_maybe: ?repo_opts.ProgressCtx,
+) !void {
+    var commit_iter = try obj.ObjectIterator(repo_kind, repo_opts).init(state, io, allocator, .{ .kind = .commit });
+    defer commit_iter.deinit();
+
+    for ([_]rf.RefKind{ .head, .tag }) |ref_kind| {
+        var iter = try rf.RefIterator(repo_kind, repo_opts).init(state, io, allocator, ref_kind, .beginning);
+        defer iter.deinit();
+
+        while (try iter.next()) |ref| {
+            if (try rf.readRecur(repo_kind, repo_opts, state, io, .{ .ref = ref })) |*oid| {
+                try commit_iter.include(oid);
+            }
+        }
+    }
+
+    while (true) {
+        const commit = commit_iter.next(allocator) catch |err| switch (err) {
+            // an existing ref that can't be walked means the repo was already
+            // damaged before this push. that isn't this push's problem, so stop
+            // marking and let the caller walk everything as it used to.
+            error.ObjectNotFound, error.InvalidObject => break,
+            else => return err,
+        } orelse break;
+        defer commit.deinit();
+        try obj_iter.putExcluded(&commit.oid);
+        try reportProgress(repo_kind, repo_opts, io, progress_ctx_maybe, .{ .complete_one = .checking_object });
+    }
+}
+
+const deny_delete_current_msg =
+    \\By default, deleting the current branch is denied, because the next
+    \\'git clone' won't result in any file checked out, causing confusion.
+    \\
+    \\You can set 'receive.denyDeleteCurrent' configuration variable to
+    \\'warn' or 'ignore' in the remote repository to allow deleting the
+    \\current branch, with or without a warning message.
+    \\
+    \\To squelch this message, you can set it to 'refuse'.
+;

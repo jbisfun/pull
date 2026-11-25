@@ -1,0 +1,10 @@
+.{
+    .name = .pull_worktree,
+    .version = "0.1.0",
+    .fingerprint = 0xd08e6d97d31dd6dc,
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .core = .{ .path = "../core" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

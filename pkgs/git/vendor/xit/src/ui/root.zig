@@ -1,0 +1,298 @@
+const std = @import("std");
+const xitui = @import("xitui");
+const wgt = xitui.widget;
+const layout = xitui.layout;
+const Key = xitui.input.Key;
+const Grid = xitui.grid.Grid;
+const Focus = xitui.focus.Focus;
+const ui = @import("../ui.zig");
+const ui_log = @import("./log.zig");
+const ui_status = @import("./status.zig");
+const ui_undo = @import("./undo.zig");
+const ui_config = @import("./config.zig");
+const rp = @import("../repo.zig");
+const inp = @import("./input.zig");
+
+pub const TabKind = enum { log, status, config, undo };
+
+pub fn RootTabs(comptime Widget: type, comptime repo_kind: rp.RepoKind) type {
+    return struct {
+        box: wgt.Box(Widget),
+        focus_ids: std.EnumArray(TabKind, ?usize),
+
+        pub fn init(allocator: std.mem.Allocator, is_bare: bool) !RootTabs(Widget, repo_kind) {
+            var box = try wgt.Box(Widget).init(allocator, .{ .border = null, .direction = .horiz });
+            errdefer box.deinit(allocator);
+            var focus_ids = std.EnumArray(TabKind, ?usize).initFill(null);
+
+            for (std.enums.values(TabKind)) |focus_kind| {
+                const name = switch (focus_kind) {
+                    .log => "log",
+                    .status => if (is_bare) continue else "status",
+                    .config => "config",
+                    .undo => if (repo_kind == .xit) "undo" else continue,
+                };
+                var text_box = try wgt.TextBox.init(allocator, name, .{ .border = .single, .wrap_kind = .none });
+                errdefer text_box.deinit(allocator);
+                text_box.getFocus().mode = .all;
+                // a min size makes the box keep the focused tab on screen when narrow
+                try box.children.put(allocator, text_box.getFocus().id, .{ .widget = .{ .text_box = text_box }, .rect = null, .min_size = .{ .width = name.len + 2, .height = null } });
+                focus_ids.set(focus_kind, text_box.getFocus().id);
+            }
+
+            var ui_root_tabs = RootTabs(Widget, repo_kind){
+                .box = box,
+                .focus_ids = focus_ids,
+            };
+            ui_root_tabs.getFocus().child_id = box.children.keys()[0];
+            return ui_root_tabs;
+        }
+
+        pub fn deinit(self: *RootTabs(Widget, repo_kind), allocator: std.mem.Allocator) void {
+            self.box.deinit(allocator);
+        }
+
+        pub fn build(self: *RootTabs(Widget, repo_kind), allocator: std.mem.Allocator, constraint: layout.Constraint, root_focus: *Focus) !void {
+            self.clearGrid();
+            for (self.box.children.keys(), self.box.children.values()) |id, *tab| {
+                const selected = self.getFocus().child_id == id;
+                tab.widget.text_box.options.border = if (selected) .single else .hidden;
+                tab.widget.text_box.options.invert = selected;
+            }
+            try self.box.build(allocator, constraint, root_focus);
+        }
+
+        pub fn input(self: *RootTabs(Widget, repo_kind), allocator: std.mem.Allocator, key: Key, root_focus: *Focus) !void {
+            _ = allocator;
+            if (self.getFocus().child_id) |child_id| {
+                const children = &self.box.children;
+                if (children.getIndex(child_id)) |current_index| {
+                    var index = current_index;
+
+                    switch (key) {
+                        .arrow_left => {
+                            index -|= 1;
+                        },
+                        .arrow_right => {
+                            if (index + 1 < self.box.children.count()) {
+                                index += 1;
+                            }
+                        },
+                        else => {},
+                    }
+
+                    if (index != current_index) {
+                        root_focus.setFocus(children.keys()[index]);
+                    }
+                }
+            }
+        }
+
+        pub fn clearGrid(self: *RootTabs(Widget, repo_kind)) void {
+            self.box.clearGrid();
+        }
+
+        pub fn getGrid(self: RootTabs(Widget, repo_kind)) ?Grid {
+            return self.box.getGrid();
+        }
+
+        pub fn getFocus(self: *RootTabs(Widget, repo_kind)) *Focus {
+            return self.box.getFocus();
+        }
+
+        pub fn getSelectedIndex(self: RootTabs(Widget, repo_kind)) ?usize {
+            if (self.box.focus.child_id) |child_id| {
+                const children = &self.box.children;
+                return children.getIndex(child_id);
+            } else {
+                return null;
+            }
+        }
+
+        pub fn getSelectedKind(self: RootTabs(Widget, repo_kind)) ?TabKind {
+            const child_id = self.box.focus.child_id orelse return null;
+            for (std.enums.values(TabKind)) |kind| {
+                if (self.focus_ids.get(kind) == child_id) return kind;
+            }
+            return null;
+        }
+
+        pub fn getChildFocusId(self: *RootTabs(Widget, repo_kind), focus_kind: TabKind) ?usize {
+            return self.focus_ids.get(focus_kind);
+        }
+    };
+}
+
+pub fn Root(comptime Widget: type, comptime repo_kind: rp.RepoKind, comptime repo_opts: rp.RepoOpts(repo_kind)) type {
+    return struct {
+        box: wgt.Box(Widget),
+        session: *ui.Session,
+
+        const FocusKind = enum { tabs, stack };
+
+        pub fn init(io: std.Io, allocator: std.mem.Allocator, repo: *rp.Repo(repo_kind, repo_opts)) !Root(Widget, repo_kind, repo_opts) {
+            const session = try allocator.create(ui.Session);
+            errdefer allocator.destroy(session);
+            session.* = .{};
+
+            const is_bare = try repo.isBare(io, allocator);
+            var box = try wgt.Box(Widget).init(allocator, .{ .border = null, .direction = .vert });
+            errdefer box.deinit(allocator);
+
+            inline for (std.meta.tags(FocusKind)) |focus_kind| {
+                switch (focus_kind) {
+                    .tabs => {
+                        var ui_root_tabs = try RootTabs(Widget, repo_kind).init(allocator, is_bare);
+                        errdefer ui_root_tabs.deinit(allocator);
+                        try box.children.put(allocator, ui_root_tabs.getFocus().id, .{ .widget = .{ .ui_root_tabs = ui_root_tabs }, .rect = null, .min_size = null });
+                    },
+                    .stack => {
+                        var stack = try wgt.Stack(Widget).init(allocator);
+                        errdefer stack.deinit(allocator);
+
+                        {
+                            var log = Widget{ .ui_log = try ui_log.Log(Widget, repo_kind, repo_opts).init(io, allocator, repo) };
+                            errdefer log.deinit(allocator);
+                            try stack.children.put(allocator, log.getFocus().id, log);
+                        }
+
+                        if (!is_bare) {
+                            var status = Widget{ .ui_status = try ui_status.Status(Widget, repo_kind, repo_opts).init(io, allocator, repo) };
+                            errdefer status.deinit(allocator);
+                            try stack.children.put(allocator, status.getFocus().id, status);
+                        }
+
+                        {
+                            var config = Widget{ .ui_config_list = try ui_config.ConfigList(Widget, repo_kind, repo_opts).init(io, allocator, repo) };
+                            errdefer config.deinit(allocator);
+                            try stack.children.put(allocator, config.getFocus().id, config);
+                        }
+
+                        if (repo_kind == .xit) {
+                            var undo = Widget{ .ui_undo = try ui_undo.Undo(Widget, repo_kind, repo_opts).init(allocator, repo, session) };
+                            errdefer undo.deinit(allocator);
+                            try stack.children.put(allocator, undo.getFocus().id, undo);
+                        }
+
+                        try box.children.put(allocator, stack.getFocus().id, .{ .widget = .{ .stack = stack }, .rect = null, .min_size = null });
+                    },
+                }
+            }
+
+            var ui_root = Root(Widget, repo_kind, repo_opts){
+                .box = box,
+                .session = session,
+            };
+            ui_root.getFocus().child_id = box.children.keys()[0];
+            return ui_root;
+        }
+
+        pub fn deinit(self: *Root(Widget, repo_kind, repo_opts), allocator: std.mem.Allocator) void {
+            self.box.deinit(allocator);
+            allocator.destroy(self.session);
+        }
+
+        pub fn build(self: *Root(Widget, repo_kind, repo_opts), allocator: std.mem.Allocator, constraint: layout.Constraint, root_focus: *Focus) !void {
+            self.clearGrid();
+            const ui_root_tabs = self.getTabs();
+            const ui_root_stack = self.getStack();
+            if (ui_root_tabs.getSelectedIndex()) |index| {
+                ui_root_stack.getFocus().child_id = ui_root_stack.children.keys()[index];
+            }
+            try self.box.build(allocator, constraint, root_focus);
+        }
+
+        pub fn input(self: *Root(Widget, repo_kind, repo_opts), allocator: std.mem.Allocator, key: Key, root_focus: *Focus) !void {
+            if (self.getFocus().child_id) |child_id| {
+                if (self.box.children.getIndex(child_id)) |current_index| {
+                    const child = &self.box.children.values()[current_index].widget;
+                    var index = current_index;
+
+                    switch (inp.vertDirection(key)) {
+                        .up => {
+                            switch (child.*) {
+                                .ui_root_tabs => {
+                                    try child.input(allocator, key, root_focus);
+                                },
+                                .stack => |stack| {
+                                    if (stack.getSelected()) |selected_widget| {
+                                        switch (selected_widget.*) {
+                                            .ui_log => {
+                                                if (selected_widget.ui_log.scrolledToTop()) {
+                                                    index = @backingInt(FocusKind.tabs);
+                                                } else {
+                                                    try child.input(allocator, key, root_focus);
+                                                }
+                                            },
+                                            .ui_status => {
+                                                if (selected_widget.ui_status.getSelectedIndex() == 0) {
+                                                    index = @backingInt(FocusKind.tabs);
+                                                } else {
+                                                    try child.input(allocator, key, root_focus);
+                                                }
+                                            },
+                                            .ui_undo => {
+                                                if (selected_widget.ui_undo.scrolledToTop()) {
+                                                    index = @backingInt(FocusKind.tabs);
+                                                } else {
+                                                    try child.input(allocator, key, root_focus);
+                                                }
+                                            },
+                                            .ui_config_list => {
+                                                if (selected_widget.ui_config_list.getSelectedIndex() == 0) {
+                                                    index = @backingInt(FocusKind.tabs);
+                                                } else {
+                                                    try child.input(allocator, key, root_focus);
+                                                }
+                                            },
+                                            else => {},
+                                        }
+                                    }
+                                },
+                                else => {},
+                            }
+                        },
+                        .down => {
+                            switch (child.*) {
+                                .ui_root_tabs => {
+                                    index = @backingInt(FocusKind.stack);
+                                },
+                                .stack => {
+                                    try child.input(allocator, key, root_focus);
+                                },
+                                else => {},
+                            }
+                        },
+                        .none => {
+                            try child.input(allocator, key, root_focus);
+                        },
+                    }
+
+                    if (index != current_index) {
+                        root_focus.setFocus(self.box.children.keys()[index]);
+                    }
+                }
+            }
+        }
+
+        pub fn getTabs(self: *Root(Widget, repo_kind, repo_opts)) *RootTabs(Widget, repo_kind) {
+            return &self.box.children.values()[@backingInt(FocusKind.tabs)].widget.ui_root_tabs;
+        }
+
+        pub fn getStack(self: *Root(Widget, repo_kind, repo_opts)) *wgt.Stack(Widget) {
+            return &self.box.children.values()[@backingInt(FocusKind.stack)].widget.stack;
+        }
+
+        pub fn clearGrid(self: *Root(Widget, repo_kind, repo_opts)) void {
+            self.box.clearGrid();
+        }
+
+        pub fn getGrid(self: Root(Widget, repo_kind, repo_opts)) ?Grid {
+            return self.box.getGrid();
+        }
+
+        pub fn getFocus(self: *Root(Widget, repo_kind, repo_opts)) *Focus {
+            return self.box.getFocus();
+        }
+    };
+}

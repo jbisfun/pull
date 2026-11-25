@@ -5,32 +5,37 @@ commits. Each repo is cloned to `{pullfile-root}/{repo-name}`. A single `pull co
 one commit, with the same message, identity and signature, to every repo that has changes,
 then records the new pins.
 
-## Crates and features
+## Packages and features
 
-pull is a cargo workspace. The core is always built; everything else is an optional
-crate behind a cargo feature of the `pull` binary, and no feature requires another:
+pull is built with Zig (0.17.1). The core is always built; everything else is an
+optional package (`pkgs/<name>`) behind a build feature of the `pull` binary, and no
+feature requires another:
 
-    crate          feature        what
-    pull-core      (always)       pullfile.plist / local.toml model, identity, path routing
-    pull-git       (always)       clone/sync, status, stage, commit across repos, push
-                   https, ssh     git transports (git2 features)
-    pull-env       env            pullfile `env` + local.toml `[env]`; pull env / pull shell
-    pull-hooks     hooks          pullfile `hooks` (precommit, postcommit, pull)
-    pull-lint      lint           pullfile `lint`; pull lint
+    package        feature        what
+    pkgs/core      (always)       pullfile.plist / local.toml model, identity, path routing
+    pkgs/git       (always)       clone/sync, status, stage, commit across repos, push
+                   https, ssh     git transports
+    pkgs/env       env            pullfile `env` + local.toml `[env]`; pull env / pull shell
+    pkgs/hooks     hooks          pullfile `hooks` (precommit, postcommit, pull)
+    pkgs/lint      lint           pullfile `lint`; pull lint
                    conventional   lint `conventional` (Conventional Commits parser)
-    pull-ignore    ignore         pullfile `ignore` -> each repo's .git/info/exclude
-    pull-worktree  worktree       pull worktree
-    pull-launchd   launchd        pullfile `jobs`; pull launchctl / pull session
-    pull-mcp       mcp            pull mcp (session/job tools only with `launchd`)
+    pkgs/ignore    ignore         pullfile `ignore` -> each repo's .git/info/exclude
+    pkgs/worktree  worktree       pull worktree
+    pkgs/tool      tool           pullfile `tool`; pull tool
+    pkgs/launchd   launchd        pullfile `jobs`; pull launchctl / pull session
+    pkgs/mcp       mcp            pull mcp (session/job tools only with `launchd`)
 
-All features are on by default. Build a smaller pull with e.g.
+All features are on by default. Install to ~/.local/bin:
 
-    cargo install --path . --no-default-features --features https,env,hooks
+    zig build -Doptimize=ReleaseSafe --prefix ~/.local
 
-Features meet only in the binary (`src/workspace.rs`): without `env`, hooks, jobs, `each`
+or build a smaller pull with e.g. `-Dfeatures=https,env,hooks`. `zig build test` runs
+every built package's tests.
+
+Features meet only in the binary (`src/workspace.zig`): without `env`, hooks, jobs, `each`
 and MCP `exec` get just PULL_ROOT; without `hooks` or `lint`, commits skip them; without
 `launchd`, the MCP server has no session tools. Only `identity` and `repos` are core
-pullfile keys: every other top-level key is a section owned by its feature crate, kept
+pullfile keys: every other top-level key is a section owned by its feature package, kept
 verbatim (and reported as ignored) when that feature isn't built, so a lean build never
 drops another build's settings. `pull --version` and `pull status --json` (`features`)
 list what a binary was built with.

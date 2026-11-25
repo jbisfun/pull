@@ -1,9 +1,0 @@
-[package]
-name = "pull-ignore"
-version = "0.1.0"
-edition = "2024"
-description = "pullfile `ignore`: shared patterns in every repo's .git/info/exclude"
-
-[dependencies]
-anyhow.workspace = true
-git2.workspace = true

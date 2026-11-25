@@ -1,0 +1,17 @@
+.{
+    .name = .pull_core,
+    .version = "0.1.0",
+    .fingerprint = 0x31b0a376c320e565,
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .xml = .{
+            .url = "git+https://github.com/nat3Github/zig-lib-xml#82233206c4f83ed190c1fd7fc976f3e2b26be4b7",
+            .hash = "xml-0.2.2-ZTbP34_NAgAvbDNF1BjVuSDNDdN8bGGrzSjsH4l20H-h",
+        },
+        .toml = .{
+            .url = "git+https://github.com/sam701/zig-toml?ref=zig-0.17#4a13e49ce7d19ac2df8b87962d9f23c0f5dd5bdd",
+            .hash = "toml-0.3.0-bV14BRmkAQDSILPPyXc31aAXPtJa1Uh8Frug3i6InAUc",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

@@ -1,0 +1,305 @@
+const std = @import("std");
+const hash = @import("./hash.zig");
+const rf = @import("./ref.zig");
+const fs = @import("./fs.zig");
+const rp = @import("./repo.zig");
+const obj = @import("./object.zig");
+
+pub fn TreeEntry(comptime hash_kind: hash.HashKind) type {
+    return struct {
+        oid: [hash.byteLen(hash_kind)]u8,
+        mode: fs.Mode,
+
+        pub fn eql(self: TreeEntry(hash_kind), other: TreeEntry(hash_kind)) bool {
+            return std.mem.eql(u8, &self.oid, &other.oid) and self.mode.eqlExact(other.mode);
+        }
+
+        pub fn isTree(self: TreeEntry(hash_kind)) bool {
+            return self.mode.content.object_type == .tree;
+        }
+    };
+}
+
+pub fn Change(comptime hash_kind: hash.HashKind) type {
+    return struct {
+        old: ?TreeEntry(hash_kind),
+        new: ?TreeEntry(hash_kind),
+    };
+}
+
+pub fn TreeDiff(comptime repo_kind: rp.RepoKind, comptime repo_opts: rp.RepoOpts(repo_kind)) type {
+    return struct {
+        changes: std.array_hash_map.String(Change(repo_opts.hash)),
+        arena: std.heap.ArenaAllocator,
+        allocator: std.mem.Allocator,
+
+        pub fn init(allocator: std.mem.Allocator) TreeDiff(repo_kind, repo_opts) {
+            return .{
+                .changes = .empty,
+                .arena = std.heap.ArenaAllocator.init(allocator),
+                .allocator = allocator,
+            };
+        }
+
+        pub fn deinit(self: *TreeDiff(repo_kind, repo_opts)) void {
+            self.changes.deinit(self.allocator);
+            self.arena.deinit();
+        }
+
+        pub fn compare(
+            self: *TreeDiff(repo_kind, repo_opts),
+            state: rp.Repo(repo_kind, repo_opts).State(.read_only),
+            io: std.Io,
+            old_oid_maybe: ?*const [hash.hexLen(repo_opts.hash)]u8,
+            new_oid_maybe: ?*const [hash.hexLen(repo_opts.hash)]u8,
+            path_list_maybe: ?*std.ArrayList([]const u8),
+        ) !void {
+            if (old_oid_maybe == null and new_oid_maybe == null) {
+                return;
+            }
+            const old_entries = try self.loadTree(state, io, old_oid_maybe);
+            const new_entries = try self.loadTree(state, io, new_oid_maybe);
+            // deletions and edits
+            {
+                var iter = old_entries.iterator();
+                while (iter.next()) |old_entry| {
+                    const old_key = old_entry.key_ptr.*;
+                    const old_value = old_entry.value_ptr.*;
+                    var path_list: std.ArrayList([]const u8) = if (path_list_maybe) |path_list| try path_list.clone(self.arena.allocator()) else .empty;
+                    try path_list.append(self.arena.allocator(), old_key);
+                    const path = try fs.joinPath(self.arena.allocator(), path_list.items);
+                    if (new_entries.get(old_key)) |new_value| {
+                        if (!old_value.eql(new_value)) {
+                            const old_value_tree = old_value.isTree();
+                            const new_value_tree = new_value.isTree();
+                            try self.compare(
+                                state,
+                                io,
+                                if (old_value_tree) &std.fmt.bytesToHex(&old_value.oid, .lower) else null,
+                                if (new_value_tree) &std.fmt.bytesToHex(&new_value.oid, .lower) else null,
+                                &path_list,
+                            );
+                            if (!old_value_tree or !new_value_tree) {
+                                try self.changes.put(self.allocator, path, Change(repo_opts.hash){ .old = if (old_value_tree) null else old_value, .new = if (new_value_tree) null else new_value });
+                            }
+                        }
+                    } else {
+                        if (old_value.isTree()) {
+                            try self.compare(state, io, &std.fmt.bytesToHex(&old_value.oid, .lower), null, &path_list);
+                        } else {
+                            try self.changes.put(self.allocator, path, Change(repo_opts.hash){ .old = old_value, .new = null });
+                        }
+                    }
+                }
+            }
+            // additions
+            {
+                var iter = new_entries.iterator();
+                while (iter.next()) |new_entry| {
+                    const new_key = new_entry.key_ptr.*;
+                    const new_value = new_entry.value_ptr.*;
+                    var path_list: std.ArrayList([]const u8) = if (path_list_maybe) |path_list| try path_list.clone(self.arena.allocator()) else .empty;
+                    try path_list.append(self.arena.allocator(), new_key);
+                    const path = try fs.joinPath(self.arena.allocator(), path_list.items);
+                    if (old_entries.get(new_key)) |_| {
+                        continue;
+                    } else if (new_value.isTree()) {
+                        try self.compare(state, io, null, &std.fmt.bytesToHex(&new_value.oid, .lower), &path_list);
+                    } else {
+                        try self.changes.put(self.allocator, path, Change(repo_opts.hash){ .old = null, .new = new_value });
+                    }
+                }
+            }
+        }
+
+        fn loadTree(
+            self: *TreeDiff(repo_kind, repo_opts),
+            state: rp.Repo(repo_kind, repo_opts).State(.read_only),
+            io: std.Io,
+            oid_maybe: ?*const [hash.hexLen(repo_opts.hash)]u8,
+        ) !std.array_hash_map.String(TreeEntry(repo_opts.hash)) {
+            if (oid_maybe) |oid| {
+                var object = try obj.Object(repo_kind, repo_opts).init(state, io, self.arena.allocator(), oid);
+                // the content is fully parsed during init and lives in the arena,
+                // so only the reader (which holds an open file in the git backend)
+                // needs to be closed. a full deinit would free the entries.
+                defer object.object_reader.deinit();
+                return switch (object.content) {
+                    .blob, .tag => .empty,
+                    .tree => |tree| tree.entries,
+                    .commit => |commit| self.loadTree(state, io, &commit.tree),
+                };
+            } else {
+                return .empty;
+            }
+        }
+    };
+}
+
+fn pathToTreeEntry(
+    comptime repo_kind: rp.RepoKind,
+    comptime repo_opts: rp.RepoOpts(repo_kind),
+    state: rp.Repo(repo_kind, repo_opts).State(.read_only),
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    parent: obj.Object(repo_kind, repo_opts),
+    path_parts: []const []const u8,
+) !?TreeEntry(repo_opts.hash) {
+    const path_part = path_parts[0];
+    const tree_entry = parent.content.tree.entries.get(path_part) orelse return null;
+
+    if (path_parts.len == 1) {
+        return tree_entry;
+    }
+
+    const oid_hex = std.fmt.bytesToHex(tree_entry.oid, .lower);
+    var tree_object = try obj.Object(repo_kind, repo_opts).init(state, io, allocator, &oid_hex);
+    defer tree_object.deinit();
+
+    switch (tree_object.content) {
+        .blob, .tag => return null,
+        .tree => return pathToTreeEntry(repo_kind, repo_opts, state, io, allocator, tree_object, path_parts[1..]),
+        .commit => return error.ObjectInvalid,
+    }
+}
+
+pub fn headTreeEntry(
+    comptime repo_kind: rp.RepoKind,
+    comptime repo_opts: rp.RepoOpts(repo_kind),
+    state: rp.Repo(repo_kind, repo_opts).State(.read_only),
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path_parts: []const []const u8,
+) !?TreeEntry(repo_opts.hash) {
+    // get the current commit
+    const current_oid = try rf.readHeadRecur(repo_kind, repo_opts, state, io);
+    var commit_object = try obj.Object(repo_kind, repo_opts).init(state, io, allocator, &current_oid);
+    defer commit_object.deinit();
+
+    // get the tree of the current commit
+    var tree_object = try obj.Object(repo_kind, repo_opts).init(state, io, allocator, &commit_object.content.commit.tree);
+    defer tree_object.deinit();
+
+    // get the entry for the given path
+    return try pathToTreeEntry(repo_kind, repo_opts, state, io, allocator, tree_object, path_parts);
+}
+
+pub fn Tree(comptime repo_kind: rp.RepoKind, comptime repo_opts: rp.RepoOpts(repo_kind)) type {
+    return struct {
+        entries: std.array_hash_map.String(TreeEntry(repo_opts.hash)),
+        arena: *std.heap.ArenaAllocator,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+
+        pub fn init(
+            state: rp.Repo(repo_kind, repo_opts).State(.read_only),
+            io: std.Io,
+            allocator: std.mem.Allocator,
+            oid_maybe: ?*const [hash.hexLen(repo_opts.hash)]u8,
+        ) !Tree(repo_kind, repo_opts) {
+            const arena = try allocator.create(std.heap.ArenaAllocator);
+            arena.* = std.heap.ArenaAllocator.init(allocator);
+            var tree = Tree(repo_kind, repo_opts){
+                .entries = .empty,
+                .arena = arena,
+                .io = io,
+                .allocator = allocator,
+            };
+            errdefer tree.deinit();
+
+            const oid = oid_maybe orelse &(try rf.readHeadRecurMaybe(repo_kind, repo_opts, state, io) orelse return tree);
+
+            var commit_object = try obj.Object(repo_kind, repo_opts).initCommit(state, io, allocator, oid);
+            defer commit_object.deinit();
+            try tree.read(state, "", &commit_object.content.commit.tree);
+
+            return tree;
+        }
+
+        pub fn deinit(self: *Tree(repo_kind, repo_opts)) void {
+            self.entries.deinit(self.allocator);
+            self.arena.deinit();
+            self.allocator.destroy(self.arena);
+        }
+
+        fn read(self: *Tree(repo_kind, repo_opts), state: rp.Repo(repo_kind, repo_opts).State(.read_only), prefix: []const u8, oid: *const [hash.hexLen(repo_opts.hash)]u8) !void {
+            var object = try obj.Object(repo_kind, repo_opts).init(state, self.io, self.allocator, oid);
+            defer object.deinit();
+
+            switch (object.content) {
+                .blob, .commit, .tag => {},
+                .tree => |tree| {
+                    for (tree.entries.keys(), tree.entries.values()) |name, tree_entry| {
+                        const path = try fs.joinPath(self.arena.allocator(), &.{ prefix, name });
+                        if (tree_entry.isTree()) {
+                            const oid_hex = std.fmt.bytesToHex(tree_entry.oid, .lower);
+                            try self.read(state, path, &oid_hex);
+                        } else {
+                            try self.entries.put(self.allocator, path, tree_entry);
+                        }
+                    }
+                },
+            }
+        }
+    };
+}
+
+// the immediate entries of one directory in a tree, commit or tag
+pub fn TreeDir(comptime repo_kind: rp.RepoKind, comptime repo_opts: rp.RepoOpts(repo_kind)) type {
+    return struct {
+        // owns the entries' memory
+        object: obj.Object(repo_kind, repo_opts),
+        entries: std.array_hash_map.String(TreeEntry(repo_opts.hash)),
+        file_name: ?[]const u8,
+
+        pub fn init(
+            state: rp.Repo(repo_kind, repo_opts).State(.read_only),
+            io: std.Io,
+            allocator: std.mem.Allocator,
+            oid: *const [hash.hexLen(repo_opts.hash)]u8,
+            path: []const u8,
+        ) !TreeDir(repo_kind, repo_opts) {
+            var object = try obj.Object(repo_kind, repo_opts).init(state, io, allocator, oid);
+            errdefer object.deinit();
+            while (true) {
+                const next_oid = switch (object.content) {
+                    .tree => break,
+                    .commit => |commit| commit.tree,
+                    .tag => |tag| tag.target,
+                    .blob => return error.ObjectInvalid,
+                };
+                const next_object = try obj.Object(repo_kind, repo_opts).init(state, io, allocator, &next_oid);
+                object.deinit();
+                object = next_object;
+            }
+
+            var file_name: ?[]const u8 = null;
+            var iter = std.mem.splitScalar(u8, path, '/');
+            while (iter.next()) |name| {
+                if (name.len == 0) continue;
+                const tree_entry = object.content.tree.entries.get(name) orelse return error.TreeEntryNotFound;
+                if (tree_entry.isTree()) {
+                    const oid_hex = std.fmt.bytesToHex(tree_entry.oid, .lower);
+                    const next_object = try obj.Object(repo_kind, repo_opts).init(state, io, allocator, &oid_hex);
+                    object.deinit();
+                    object = next_object;
+                    if (object.content != .tree) return error.ObjectInvalid;
+                } else {
+                    // a file ends the path; anything after it can't exist
+                    if (iter.next() != null) return error.TreeEntryNotFound;
+                    file_name = name;
+                }
+            }
+
+            return .{
+                .object = object,
+                .entries = object.content.tree.entries,
+                .file_name = file_name,
+            };
+        }
+
+        pub fn deinit(self: *TreeDir(repo_kind, repo_opts)) void {
+            self.object.deinit();
+        }
+    };
+}

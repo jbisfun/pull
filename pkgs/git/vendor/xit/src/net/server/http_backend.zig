@@ -1,0 +1,342 @@
+const std = @import("std");
+const common = @import("./common.zig");
+const receive_pack = @import("./receive_pack.zig");
+const upload_pack = @import("./upload_pack.zig");
+const pkt = @import("./pkt.zig");
+
+const rp = @import("../../repo.zig");
+const cfg = @import("../../config.zig");
+
+pub const HandlerKind = enum {
+    get_info_refs,
+    run_service,
+};
+
+pub const Options = struct {
+    request_method: std.http.Method,
+    handler: HandlerKind,
+    suffix: []const u8,
+    query_string: []const u8,
+    content_type: []const u8,
+    has_remote_user: bool,
+    protocol_version: common.ProtocolVersion,
+};
+
+pub const ResponseKind = enum {
+    cgi,
+    http,
+};
+
+const Route = struct {
+    method: std.http.Method,
+    suffix: []const u8,
+    handler: HandlerKind,
+};
+
+pub const routes = [_]Route{
+    .{ .method = .GET, .suffix = "/info/refs", .handler = .get_info_refs },
+    .{ .method = .POST, .suffix = "/git-upload-pack", .handler = .run_service },
+    .{ .method = .POST, .suffix = "/git-receive-pack", .handler = .run_service },
+};
+
+const Config = struct {
+    uploadpack: bool = true,
+    // null uses git's default: enabled for authenticated users and disabled
+    // for anonymous users. an explicit value wins over the default.
+    receivepack: ?bool = null,
+};
+
+fn receivePackEnabled(config: *const Config, has_remote_user: bool) bool {
+    return config.receivepack orelse has_remote_user;
+}
+
+test "receive-pack authentication defaults do not override config" {
+    try std.testing.expect(!receivePackEnabled(&.{}, false));
+    try std.testing.expect(receivePackEnabled(&.{}, true));
+    try std.testing.expect(!receivePackEnabled(&.{ .receivepack = false }, true));
+    try std.testing.expect(receivePackEnabled(&.{ .receivepack = true }, false));
+}
+
+pub fn resolveDir(
+    allocator: std.mem.Allocator,
+    cwd_path: []const u8,
+    environ_map: *std.process.Environ.Map,
+) ![]const u8 {
+    var path_buf: [4096]u8 = undefined;
+    const path = try resolveRepoPath(environ_map, &path_buf);
+
+    const dir = for (&routes) |*svc| {
+        if (std.mem.endsWith(u8, path, svc.suffix)) {
+            break path[0 .. path.len - svc.suffix.len];
+        }
+    } else return error.NotFound;
+
+    return try std.Io.Dir.path.resolveAlloc(allocator, &.{ cwd_path, dir });
+}
+
+// whether the request needs a write state. only a push's commands and pack
+// do. its ref advertisement and every fetch request only read the repo.
+pub fn needsWriteState(options: Options) bool {
+    return options.handler == .run_service and std.mem.eql(u8, options.suffix, "/git-receive-pack");
+}
+
+// `write_state_maybe` is the state a push writes to. without one, a push is refused.
+pub fn run(
+    comptime repo_kind: rp.RepoKind,
+    comptime repo_opts: rp.RepoOpts(repo_kind),
+    state: rp.Repo(repo_kind, repo_opts).State(.read_only),
+    write_state_maybe: ?rp.Repo(repo_kind, repo_opts).State(.read_write),
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    reader: *std.Io.Reader,
+    writer: *std.Io.Writer,
+    response_kind: ResponseKind,
+    options: Options,
+    progress_ctx_maybe: ?repo_opts.ProgressCtx,
+) !void {
+    // method validation
+    for (&routes) |*svc| {
+        if (svc.handler == options.handler) {
+            if (options.request_method != svc.method) {
+                try sendBadRequest(response_kind, writer, svc.method, options);
+                return error.CancelTransaction;
+            }
+            break;
+        }
+    }
+
+    runRoute(repo_kind, repo_opts, state, write_state_maybe, io, allocator, reader, writer, response_kind, options, progress_ctx_maybe) catch |err| switch (err) {
+        error.Forbidden, error.ServiceNotEnabled => {
+            try sendForbidden(response_kind, writer);
+            return error.CancelTransaction;
+        },
+        error.BadRequest, error.UnsupportedMediaType => return error.CancelTransaction,
+        else => return err,
+    };
+}
+
+fn runRoute(
+    comptime repo_kind: rp.RepoKind,
+    comptime repo_opts: rp.RepoOpts(repo_kind),
+    state: rp.Repo(repo_kind, repo_opts).State(.read_only),
+    write_state_maybe: ?rp.Repo(repo_kind, repo_opts).State(.read_write),
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    reader: *std.Io.Reader,
+    writer: *std.Io.Writer,
+    response_kind: ResponseKind,
+    options: Options,
+    progress_ctx_maybe: ?repo_opts.ProgressCtx,
+) !void {
+    // read http config
+    var http_config = Config{};
+    {
+        var config = try cfg.Config(repo_kind, repo_opts).init(state, io, allocator);
+        defer config.deinit();
+
+        if (config.sections.get("http")) |vars| {
+            if (vars.get("uploadpack")) |v| http_config.uploadpack = cfg.parseBool(v);
+            if (vars.get("receivepack")) |v| http_config.receivepack = cfg.parseBool(v);
+        }
+    }
+
+    switch (options.handler) {
+        .get_info_refs => try getInfoRefs(repo_kind, repo_opts, state, io, allocator, reader, writer, response_kind, options, &http_config),
+        .run_service => try runService(repo_kind, repo_opts, state, write_state_maybe, io, allocator, reader, writer, response_kind, options, &http_config, progress_ctx_maybe),
+    }
+}
+
+fn httpStatus(response_kind: ResponseKind, writer: *std.Io.Writer, code: u16, msg: []const u8) !void {
+    switch (response_kind) {
+        .cgi => try writer.print("Status: {d} {s}\r\n", .{ code, msg }),
+        .http => try writer.print("HTTP/1.1 {d} {s}\r\n", .{ code, msg }),
+    }
+}
+
+fn writeHeader(writer: *std.Io.Writer, name: []const u8, value: []const u8) !void {
+    try writer.print("{s}: {s}\r\n", .{ name, value });
+}
+
+fn writeNocacheHeaders(writer: *std.Io.Writer) !void {
+    try writeHeader(writer, "Expires", "Fri, 01 Jan 1980 00:00:00 GMT");
+    try writeHeader(writer, "Pragma", "no-cache");
+    try writeHeader(writer, "Cache-Control", "no-cache, max-age=0, must-revalidate");
+}
+
+fn finishHeaders(response_kind: ResponseKind, writer: *std.Io.Writer) !void {
+    switch (response_kind) {
+        .cgi => {
+            try writer.writeAll("\r\n");
+            try writer.flush();
+        },
+        .http => {
+            try writer.writeAll("Connection: close\r\n\r\n");
+            try writer.flush();
+        },
+    }
+}
+
+pub fn sendNotFound(writer: *std.Io.Writer) !void {
+    try sendNotFoundResponse(.cgi, writer);
+}
+
+pub fn sendNotFoundResponse(response_kind: ResponseKind, writer: *std.Io.Writer) !void {
+    try httpStatus(response_kind, writer, 404, "Not Found");
+    try writeNocacheHeaders(writer);
+    try finishHeaders(response_kind, writer);
+}
+
+fn sendForbidden(response_kind: ResponseKind, writer: *std.Io.Writer) !void {
+    try httpStatus(response_kind, writer, 403, "Forbidden");
+    try writeNocacheHeaders(writer);
+    try finishHeaders(response_kind, writer);
+}
+
+fn sendBadRequest(response_kind: ResponseKind, writer: *std.Io.Writer, allowed_method: std.http.Method, options: Options) !void {
+    if (options.request_method != allowed_method) {
+        try httpStatus(response_kind, writer, 405, "Method Not Allowed");
+        try writeHeader(writer, "Allow", @tagName(allowed_method));
+    } else {
+        try httpStatus(response_kind, writer, 400, "Bad Request");
+    }
+    try writeNocacheHeaders(writer);
+    try finishHeaders(response_kind, writer);
+}
+
+pub fn resolveRepoPath(environ_map: *std.process.Environ.Map, buf: []u8) ![]const u8 {
+    if (environ_map.get("GIT_PROJECT_ROOT")) |root| {
+        const path_info = environ_map.get("PATH_INFO") orelse return error.NotFound;
+        // reject .. segments for path traversal safety
+        var iter = std.mem.splitScalar(u8, path_info, '/');
+        while (iter.next()) |segment| {
+            if (std.mem.eql(u8, segment, "..")) return error.Forbidden;
+        }
+        if (root.len + path_info.len > buf.len) return error.NotFound;
+        @memcpy(buf[0..root.len], root);
+        @memcpy(buf[root.len..][0..path_info.len], path_info);
+        return buf[0 .. root.len + path_info.len];
+    }
+    const path = environ_map.get("PATH_TRANSLATED") orelse return error.NotFound;
+    var iter = std.mem.splitScalar(u8, path, '/');
+    while (iter.next()) |segment| {
+        if (std.mem.eql(u8, segment, "..")) return error.Forbidden;
+    }
+    return path;
+}
+
+fn getInfoRefs(
+    comptime repo_kind: rp.RepoKind,
+    comptime repo_opts: rp.RepoOpts(repo_kind),
+    state: rp.Repo(repo_kind, repo_opts).State(.read_only),
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    reader: *std.Io.Reader,
+    writer: *std.Io.Writer,
+    response_kind: ResponseKind,
+    options: Options,
+    http_config: *const Config,
+) !void {
+    // smart protocol: ?service=git-upload-pack or ?service=git-receive-pack
+    if (std.mem.startsWith(u8, options.query_string, "service=git-upload-pack")) {
+        if (!http_config.uploadpack) return error.ServiceNotEnabled;
+        try httpStatus(response_kind, writer, 200, "OK");
+        try writeHeader(writer, "Content-Type", "application/x-git-upload-pack-advertisement");
+        try writeNocacheHeaders(writer);
+        try finishHeaders(response_kind, writer);
+
+        if (options.protocol_version != .v2) {
+            try pkt.writePktLineFmt(writer, "# service=git-upload-pack\n", .{});
+            try pkt.writePktFlush(writer);
+        }
+
+        try upload_pack.run(repo_kind, repo_opts, state, io, allocator, reader, writer, .{
+            .protocol_version = options.protocol_version,
+            .advertise_refs = true,
+            .is_stateless = true,
+        }, null);
+        // no need to make a new transaction
+        return error.CancelTransaction;
+    }
+
+    if (std.mem.startsWith(u8, options.query_string, "service=git-receive-pack")) {
+        if (!receivePackEnabled(http_config, options.has_remote_user)) return error.ServiceNotEnabled;
+        try httpStatus(response_kind, writer, 200, "OK");
+        try writeHeader(writer, "Content-Type", "application/x-git-receive-pack-advertisement");
+        try writeNocacheHeaders(writer);
+        try finishHeaders(response_kind, writer);
+
+        if (options.protocol_version != .v2) {
+            try pkt.writePktLineFmt(writer, "# service=git-receive-pack\n", .{});
+            try pkt.writePktFlush(writer);
+        }
+
+        try receive_pack.advertise(repo_kind, repo_opts, state, io, allocator, writer, .{ .protocol_version = options.protocol_version });
+        // no need to make a new transaction
+        return error.CancelTransaction;
+    }
+
+    return error.BadRequest;
+}
+
+fn runService(
+    comptime repo_kind: rp.RepoKind,
+    comptime repo_opts: rp.RepoOpts(repo_kind),
+    state: rp.Repo(repo_kind, repo_opts).State(.read_only),
+    write_state_maybe: ?rp.Repo(repo_kind, repo_opts).State(.read_write),
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    reader: *std.Io.Reader,
+    writer: *std.Io.Writer,
+    response_kind: ResponseKind,
+    options: Options,
+    http_config: *const Config,
+    progress_ctx_maybe: ?repo_opts.ProgressCtx,
+) !void {
+    // strip "/git-" prefix from suffix (e.g. "/git-upload-pack" -> "upload-pack")
+    const service = if (std.mem.startsWith(u8, options.suffix, "/git-"))
+        options.suffix["/git-".len..]
+    else
+        return error.BadRequest;
+
+    const is_upload = std.mem.eql(u8, service, "upload-pack");
+    const is_receive = std.mem.eql(u8, service, "receive-pack");
+
+    if (!is_upload and !is_receive) return error.BadRequest;
+
+    if (is_upload and !http_config.uploadpack) return error.ServiceNotEnabled;
+    if (is_receive and !receivePackEnabled(http_config, options.has_remote_user)) return error.ServiceNotEnabled;
+
+    // validate content-type
+    var expected_ct_buf: [64]u8 = undefined;
+    const expected_ct = std.mem.print(&expected_ct_buf, "application/x-git-{s}-request", .{service}) catch return error.BadRequest;
+    if (!std.mem.eql(u8, options.content_type, expected_ct)) {
+        try httpStatus(response_kind, writer, 415, "Unsupported Media Type");
+        try writeNocacheHeaders(writer);
+        try finishHeaders(response_kind, writer);
+        return error.UnsupportedMediaType;
+    }
+
+    // response headers
+    var result_ct_buf: [64]u8 = undefined;
+    const result_ct = std.mem.print(&result_ct_buf, "application/x-git-{s}-result", .{service}) catch return error.BadRequest;
+    try httpStatus(response_kind, writer, 200, "OK");
+    try writeHeader(writer, "Content-Type", result_ct);
+    try writeNocacheHeaders(writer);
+    try finishHeaders(response_kind, writer);
+
+    // dispatch
+    if (is_upload) {
+        try upload_pack.run(repo_kind, repo_opts, state, io, allocator, reader, writer, .{
+            .protocol_version = options.protocol_version,
+            .is_stateless = true,
+        }, progress_ctx_maybe);
+        // no need to make a new transaction
+        return error.CancelTransaction;
+    } else {
+        const write_state = write_state_maybe orelse return error.Forbidden;
+        try receive_pack.run(repo_kind, repo_opts, write_state, io, allocator, reader, writer, .{
+            .protocol_version = options.protocol_version,
+            .is_stateless = true,
+        }, progress_ctx_maybe);
+    }
+}

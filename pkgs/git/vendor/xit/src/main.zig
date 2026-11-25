@@ -1,0 +1,903 @@
+//! you're looking at my hopeless attempt to implement
+//! the successor to git. behold the three rules of xit:
+//!
+//! 1. keep the codebase small and stupid.
+//! 2. prefer simple 80% solutions over complex 100% solutions.
+//! 3. never take yourself too seriously. be a dork, and you'll
+//! attract dorks. together, we'll make a glorious pack of strays.
+//!
+//! "C'mon Alex! You always dreamt about going on a big adventure!
+//!  Let this be our first!" -- Lunar: Silver Star Story
+
+const std = @import("std");
+const builtin = @import("builtin");
+const xitui = @import("xitui");
+const term = xitui.terminal;
+const cmd = @import("./command.zig");
+const rp = @import("./repo.zig");
+const ui = @import("./ui.zig");
+const hash = @import("./hash.zig");
+const df = @import("./diff.zig");
+const work = @import("./workdir.zig");
+const mrg = @import("./merge.zig");
+const tr = @import("./tree.zig");
+const rf = @import("./ref.zig");
+const cfg = @import("./config.zig");
+const net_refspec = @import("./net/refspec.zig");
+const server_common = @import("./net/server/common.zig");
+const server_http_backend = @import("./net/server/http_backend.zig");
+
+// cook the terminal before a panic/segfault trace is printed, so the trace
+// isn't mangled by raw mode and the alternate buffer
+pub const std_options_debug_io = term.crash_debug_io;
+
+pub const RunOpts = struct {
+    out: *std.Io.Writer,
+    err: *std.Io.Writer,
+    environ_map: *std.process.Environ.Map,
+    color: bool,
+};
+
+// std.Progress.start can only be called once per process
+var progress_root: ?std.Progress.Node = null;
+
+/// clears the progress line. call before printing anything else.
+fn endProgress() void {
+    if (progress_root) |root| root.end();
+    progress_root = .none; // a later start is a no-op
+}
+
+const ProgressCtx = struct {
+    run_opts: RunOpts,
+    clear_line: *bool,
+    node: *?std.Progress.Node,
+
+    pub fn run(self: @This(), io: std.Io, event: rp.ProgressEvent) !void {
+        switch (event) {
+            .start => |start| {
+                if (self.node.*) |node| {
+                    node.end();
+                }
+                const root = progress_root orelse blk: {
+                    const root = std.Progress.start(io, .{});
+                    progress_root = root;
+                    break :blk root;
+                };
+                const name = switch (start.kind) {
+                    .writing_object_from_pack => "Writing object from pack",
+                    .writing_object => "Writing object",
+                    .writing_patch => "Writing patch",
+                    .enumerating_object => "Enumerating object",
+                    .compressing_object => "Compressing object",
+                    .checking_object => "Checking object",
+                    .walking_commit => "Walking commit",
+                    .walking_patch => "Walking patch",
+                    .preparing_patch_walk => "Preparing patch walk",
+                    .sending_bytes => "Sending bytes",
+                    .receiving_bytes => "Receiving bytes",
+                    .pruning_database => "Pruning database",
+                    .compacting_database => "Compacting database",
+                };
+                // a byte phase names its progress instead of counting items
+                const total = switch (start.kind) {
+                    .sending_bytes, .receiving_bytes, .compacting_database => 0,
+                    else => start.estimated_total_items,
+                };
+                self.node.* = root.start(name, total);
+            },
+            .complete_one => if (self.node.*) |node| node.completeOne(),
+            .complete_total => |complete_total| if (self.node.*) |node| {
+                var buffer: [std.Progress.Node.max_name_len]u8 = undefined;
+                switch (complete_total.kind) {
+                    .sending_bytes => node.setName(try std.mem.print(&buffer, "Sending bytes: {Bi:.2}", .{complete_total.count})),
+                    .receiving_bytes => node.setName(try std.mem.print(&buffer, "Receiving bytes: {Bi:.2}", .{complete_total.count})),
+                    .compacting_database => node.setName(try std.mem.print(&buffer, "Compacting database: {Bi:.2}", .{complete_total.count})),
+                    else => node.setCompletedItems(complete_total.count),
+                }
+            },
+            .child_text => |text| if (self.node.*) |node| {
+                _ = node.start(text, 0);
+            },
+            .end => if (self.node.*) |node| {
+                node.end();
+                self.node.* = null;
+            },
+            .text => |text| {
+                if (text.len == 0) return;
+                // keep the progress thread from redrawing mid-write
+                _ = try io.lockStderr(&.{}, null);
+                defer io.unlockStderr();
+                if (self.clear_line.*) {
+                    try self.run_opts.out.print("\x1B[F", .{});
+                }
+                const ends_with_newline = std.mem.endsWith(u8, text, "\n");
+                try self.run_opts.out.print("{s}{s}", .{ text, if (ends_with_newline) "" else "\n" });
+                self.clear_line.* = !ends_with_newline;
+            },
+        }
+    }
+};
+
+/// this is meant to be the main entry point if you wanted to use xit
+/// as a CLI tool. to use xit programmatically, build a Repo struct
+/// and call methods on it directly. to use xit subconsciously, just
+/// think about it really often and eventually you'll dream about it.
+pub fn run(
+    comptime repo_kind: rp.RepoKind,
+    comptime any_repo_opts: rp.AnyRepoOpts(repo_kind),
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    args: []const []const u8,
+    cwd_path: []const u8,
+    run_opts: RunOpts,
+) !void {
+    var cmd_args = try cmd.CommandArgs.init(allocator, args);
+    defer cmd_args.deinit();
+
+    // the cli reads the user's config like git does. library users get
+    // nothing unless they ask for it, so tests stay unaffected by it.
+    const global_config_path = try cfg.globalConfigPath(io, allocator, run_opts.environ_map);
+    defer if (global_config_path) |path| allocator.free(path);
+
+    switch (try cmd.CommandDispatch(any_repo_opts.toRepoOpts().hash).init(&cmd_args)) {
+        .invalid => |invalid| switch (invalid) {
+            .command => |command| {
+                try run_opts.err.print("\"{s}\" is not a valid command\n\n", .{command});
+                try cmd.printHelp(null, run_opts.err);
+                return error.HandledError;
+            },
+            .argument => |argument| {
+                try run_opts.err.print("\"{s}\" is not a valid argument\n\n", .{argument.value});
+                try cmd.printHelp(argument.command, run_opts.err);
+                return error.HandledError;
+            },
+        },
+        .help => |cmd_kind_maybe| try cmd.printHelp(cmd_kind_maybe, run_opts.out),
+        .tui => |cmd_kind_maybe| {
+            const color = std.mem.eql(u8, run_opts.environ_map.get("NO_COLOR") orelse "", "");
+            if (any_repo_opts.hash) |hash_kind| {
+                var repo = try rp.Repo(repo_kind, any_repo_opts.toRepoOptsWithHash(hash_kind)).open(io, allocator, .{ .path = cwd_path, .global_config_path = global_config_path });
+                defer repo.deinit(io, allocator);
+                try ui.start(repo_kind, any_repo_opts.toRepoOptsWithHash(hash_kind), &repo, io, allocator, cmd_kind_maybe, color);
+            } else {
+                // if no hash was specified, use AnyRepo to detect the hash being used
+                var any_repo = try rp.AnyRepo(repo_kind, any_repo_opts).open(io, allocator, .{ .path = cwd_path, .global_config_path = global_config_path });
+                defer any_repo.deinit(io, allocator);
+                switch (any_repo) {
+                    inline else => |*repo| try ui.start(repo.self_repo_kind, repo.self_repo_opts, repo, io, allocator, cmd_kind_maybe, color),
+                }
+            }
+        },
+        .cli => |cli_cmd| switch (cli_cmd) {
+            .init => |init_cmd| {
+                const repo_opts = comptime if (any_repo_opts.hash) |hash_kind|
+                    any_repo_opts.toRepoOptsWithHash(hash_kind)
+                else
+                    // if no hash was specified, just use the default hash
+                    any_repo_opts.toRepoOpts();
+                const work_path = try std.Io.Dir.path.resolveAlloc(allocator, &.{ cwd_path, init_cmd.dir });
+                defer allocator.free(work_path);
+                var repo = try rp.Repo(repo_kind, repo_opts).init(io, allocator, .{ .cwd_path = cwd_path, .path = work_path, .bare = init_cmd.bare, .global_config_path = global_config_path });
+                defer repo.deinit(io, allocator);
+
+                try run_opts.out.print(
+                    \\congrats, you just created a new repo! aren't you special.
+                    \\try setting your name and email like this:
+                    \\
+                    \\    xit config add user.name foo
+                    \\    xit config add user.email foo@bar
+                    \\
+                , .{});
+            },
+            .clone => |clone_cmd| {
+                const work_path = try std.Io.Dir.path.resolveAlloc(allocator, &.{ cwd_path, clone_cmd.local_path });
+                defer allocator.free(work_path);
+                var clear_line = false;
+                var progress_node: ?std.Progress.Node = null;
+                var repo = try rp.AnyRepo(repo_kind, any_repo_opts).clone(
+                    io,
+                    allocator,
+                    clone_cmd.url,
+                    cwd_path,
+                    work_path,
+                    global_config_path,
+                    .{ .bare = clone_cmd.bare, .transport = .{ .progress_ctx = if (any_repo_opts.ProgressCtx == void) {} else .{ .run_opts = run_opts, .clear_line = &clear_line, .node = &progress_node } } },
+                );
+                endProgress();
+                defer repo.deinit(io, allocator);
+
+                if (repo_kind == .xit) {
+                    try run_opts.out.print(
+                        \\
+                        \\clone complete!
+                        \\
+                    , .{});
+                }
+            },
+            else => {
+                // some commands allow the path to be specified. for all others, just use the cwd path.
+                const work_path_maybe = switch (cli_cmd) {
+                    .upload_pack => |upload_pack| try std.Io.Dir.path.resolveAlloc(allocator, &.{ cwd_path, upload_pack.dir }),
+                    .receive_pack => |receive_pack| try std.Io.Dir.path.resolveAlloc(allocator, &.{ cwd_path, receive_pack.dir }),
+                    .http_backend => server_http_backend.resolveDir(allocator, cwd_path, run_opts.environ_map) catch {
+                        var http_stdout_buf: [any_repo_opts.buffer_size]u8 = undefined;
+                        var http_stdout_writer = std.Io.File.stdout().writer(io, &http_stdout_buf);
+                        try server_http_backend.sendNotFound(&http_stdout_writer.interface);
+                        return;
+                    },
+                    else => null,
+                };
+                defer if (work_path_maybe) |work_path| allocator.free(work_path);
+                const work_path = work_path_maybe orelse cwd_path;
+
+                if (any_repo_opts.hash) |hash_kind| {
+                    var repo = try rp.Repo(repo_kind, any_repo_opts.toRepoOptsWithHash(hash_kind)).open(io, allocator, .{ .path = work_path, .global_config_path = global_config_path });
+                    defer repo.deinit(io, allocator);
+                    try runCommand(repo_kind, any_repo_opts.toRepoOptsWithHash(hash_kind), &repo, io, allocator, cli_cmd, run_opts);
+                } else {
+                    // if no hash was specified, use AnyRepo to detect the hash being used
+                    var any_repo = try rp.AnyRepo(repo_kind, any_repo_opts).open(io, allocator, .{ .path = work_path, .global_config_path = global_config_path });
+                    defer any_repo.deinit(io, allocator);
+                    switch (any_repo) {
+                        inline else => |*repo| {
+                            const cmd_maybe = try cmd.Command(repo.self_repo_opts.hash).initMaybe(&cmd_args);
+                            try runCommand(repo.self_repo_kind, repo.self_repo_opts, repo, io, allocator, cmd_maybe orelse return error.InvalidCommand, run_opts);
+                        },
+                    }
+                }
+            },
+        },
+    }
+}
+
+/// like `run` except it prints user-friendly error messages
+pub fn runPrint(
+    comptime repo_kind: rp.RepoKind,
+    comptime any_repo_opts: rp.AnyRepoOpts(repo_kind),
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    args: []const []const u8,
+    cwd_path: []const u8,
+    run_opts: RunOpts,
+) !void {
+    run(repo_kind, any_repo_opts, io, allocator, args, cwd_path, run_opts) catch |err| {
+        endProgress();
+        const message: []const u8 = switch (err) {
+            error.RepoNotFound => {
+                try run_opts.err.print(
+                    \\repo not found, dummy.
+                    \\either you're in the wrong place or you need to make a new one like this:
+                    \\
+                    \\
+                , .{});
+                try cmd.printHelp(.init, run_opts.err);
+                return error.HandledError;
+            },
+            error.BareRepository => "this operation requires a worktree and cannot run on a bare repository\n",
+            error.UnsupportedRepoLayout => "this repository layout is not supported\n",
+            error.UnsupportedOperationForSha256 => "the requested operation is not supported for this sha256 git repository\n",
+            error.UnexpectedHashKind, error.ObjectFormatMismatch => "the repository object format does not match the selected hash\n",
+            error.UnsupportedObjectFormat => "this repository object format is not supported\n",
+            error.UnexpectedFilesInTargetDirectory => "the destination directory must be empty\n",
+            error.RepoFormatTooOld =>
+            \\this repo was made by an older version of xit,
+            \\and the format has changed since then.
+            \\
+            ,
+            error.RepoAlreadyExists =>
+            \\repo already exists, dummy.
+            \\two repos in the same directory makes no sense.
+            \\think about it.
+            \\
+            ,
+            error.CannotRemoveFileWithStagedAndUnstagedChanges,
+            error.CannotRemoveFileWithStagedChanges,
+            error.CannotRemoveFileWithUnstagedChanges,
+            => "a file has uncommitted changes. if you really want to do it, throw caution into the wind by adding the -f flag.\n",
+            error.EmptyCommit => "you haven't added anything to commit yet. if you really want to commit anyway, add the --allow-empty flag and no one will judge you.\n",
+            error.AddIndexPathNotFound => "a path you are adding does not exist\n",
+            error.RemoveIndexPathNotFound => "a path you are removing does not exist\n",
+            error.RecursiveOptionRequired => "to do this on a dir, add the -r flag\n",
+            error.RefNotFound => "ref does not exist\n",
+            error.BranchAlreadyExists => "branch already exists\n",
+            error.UserConfigNotFound =>
+            \\you need to set your name and email, mystery man. you can do it like this:
+            \\
+            \\    xit config add user.name foo
+            \\    xit config add user.email foo@bar
+            \\
+            ,
+            error.ObjectSigningFailed =>
+            \\ssh-keygen couldn't sign that. check that `user.signingkey` points at a
+            \\key it can read. to see why it failed, try signing a file by hand:
+            \\
+            \\    ssh-keygen -Y sign -n git -f <your key> <some file>
+            \\
+            ,
+            error.UnsupportedSigningFormat =>
+            \\you asked for signing, but xit only knows how to sign with ssh.
+            \\set `gpg.format` to ssh, or turn signing off:
+            \\
+            \\    xit config add gpg.format ssh
+            \\
+            ,
+            error.SigningKeyNotFound =>
+            \\you asked for signing, but there's no key to sign with. set one like this:
+            \\
+            \\    xit config add user.signingkey ~/.ssh/id_ed25519.pub
+            \\
+            ,
+            error.SectionDoesNotExist =>
+            \\that variable isn't in this repo's config, so there's nothing to remove.
+            \\if you can see it in `xit config list`, it's coming from your global
+            \\config, and xit won't touch that.
+            \\
+            ,
+            error.SubmodulesNotSupported => "repos with submodules aren't supported right now, sowwy\n",
+            error.InvalidMergeSource => "your merge source doesn't look right and you should feel bad\n",
+            error.MultipleMergeBases => "these histories have multiple merge bases; merging them isn't supported yet\n",
+            error.CannotMergeWithLocalChanges => "commit or unstage staged changes, and move or restore local files that the merge would overwrite\n",
+            error.InvalidSwitchTarget => "your switch target doesn't look right and you should feel bad\n",
+            error.UnfinishedMergeInProgress => "there is an unfinished merge in progress! use `--continue` or `--abort` to finish it.\n",
+            error.OtherMergeInProgress => "there's another merge already in progress! use `--continue` or `--abort` to finish it.\n",
+            error.CannotContinueMergeWithUnresolvedConflicts => "you haven't resolved all the conflicts! after fixing, run `xit add` on them.\n",
+            error.RemoteRefContainsCommitsNotFoundLocally =>
+            \\a ref you are pushing to contains commits you don't have locally.
+            \\you either need to retrieve them with `xit fetch` and then `xit merge`,
+            \\or if you want to obliterate them like a badass, run this command with `-f`.
+            \\
+            ,
+            error.RemoteRefContainsIncompatibleHistory =>
+            \\a ref you are pushing to has commits with an incompatible history.
+            \\if you want to obliterate them like a badass, run this command with `-f`.
+            \\
+            ,
+            else => |e| return e,
+        };
+        try run_opts.err.print("{s}", .{message});
+        return error.HandledError;
+    };
+}
+
+/// executes a command on the given repo
+fn runCommand(
+    comptime repo_kind: rp.RepoKind,
+    comptime repo_opts: rp.RepoOpts(repo_kind),
+    repo: *rp.Repo(repo_kind, repo_opts),
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    command: cmd.Command(repo_opts.hash),
+    run_opts: RunOpts,
+) !void {
+    switch (command) {
+        .init => {},
+        .add => |add_cmd| try repo.add(io, allocator, add_cmd.paths),
+        .unadd => |unadd_cmd| try repo.unadd(io, allocator, unadd_cmd.paths, unadd_cmd.opts),
+        .untrack => |untrack_cmd| try repo.untrack(io, allocator, untrack_cmd.paths, untrack_cmd.opts),
+        .rm => |rm_cmd| try repo.remove(io, allocator, rm_cmd.paths, rm_cmd.opts),
+        .commit => |commit_cmd| _ = try repo.commit(io, allocator, commit_cmd),
+        .tag => |tag_cmd| switch (tag_cmd) {
+            .list => {
+                var ref_iter = try repo.listTags(io, allocator, .beginning);
+                defer ref_iter.deinit();
+
+                while (try ref_iter.next()) |ref| {
+                    try run_opts.out.print("{s}\n", .{ref.name});
+                }
+            },
+            .add => |add_tag| _ = try repo.addTag(io, allocator, add_tag),
+            .remove => |rm_tag| try repo.removeTag(io, rm_tag),
+        },
+        .status => {
+            var head_buffer: [rf.MAX_REF_CONTENT_SIZE]u8 = @splat(0);
+            switch (try repo.head(io, &head_buffer)) {
+                .ref => |ref| try run_opts.out.print("on branch {s}\n\n", .{ref.name}),
+                .oid => |oid| try run_opts.out.print("HEAD detached at {s}\n\n", .{oid}),
+            }
+
+            var stat = try repo.status(io, allocator);
+            defer stat.deinit(allocator);
+
+            for (stat.untracked.values()) |entry| {
+                try run_opts.out.print("?? {s}\n", .{entry.path});
+            }
+
+            for (stat.work_dir_modified.values()) |entry| {
+                try run_opts.out.print(" M {s}\n", .{entry.path});
+            }
+
+            for (stat.work_dir_deleted.keys()) |path| {
+                try run_opts.out.print(" D {s}\n", .{path});
+            }
+
+            for (stat.index_added.keys()) |path| {
+                try run_opts.out.print("A  {s}\n", .{path});
+            }
+
+            for (stat.index_modified.keys()) |path| {
+                try run_opts.out.print("M  {s}\n", .{path});
+            }
+
+            for (stat.index_deleted.keys()) |path| {
+                try run_opts.out.print("D  {s}\n", .{path});
+            }
+
+            for (stat.unresolved_conflicts.keys(), stat.unresolved_conflicts.values()) |path, conflict| {
+                if (conflict.base) {
+                    if (conflict.target) {
+                        if (conflict.source) {
+                            try run_opts.out.print("UU {s}\n", .{path}); // both modified
+                        } else {
+                            try run_opts.out.print("UD {s}\n", .{path}); // deleted by them
+                        }
+                    } else {
+                        if (conflict.source) {
+                            try run_opts.out.print("DU {s}\n", .{path}); // deleted by us
+                        } else {
+                            return error.InvalidConflict;
+                        }
+                    }
+                } else {
+                    if (conflict.target) {
+                        if (conflict.source) {
+                            try run_opts.out.print("AA {s}\n", .{path}); // both added
+                        } else {
+                            try run_opts.out.print("AU {s}\n", .{path}); // added by us
+                        }
+                    } else {
+                        if (conflict.source) {
+                            try run_opts.out.print("UA {s}\n", .{path}); // added by them
+                        } else {
+                            return error.InvalidConflict;
+                        }
+                    }
+                }
+            }
+        },
+        .diff_dir, .diff_added => |diff_cmd| {
+            const DiffState = union(df.DiffKind) {
+                work_dir: work.Status(repo_kind, repo_opts),
+                index: work.Status(repo_kind, repo_opts),
+                tree: tr.TreeDiff(repo_kind, repo_opts),
+
+                fn deinit(diff_state: *@This(), inner_allocator: std.mem.Allocator) void {
+                    switch (diff_state.*) {
+                        .work_dir => diff_state.work_dir.deinit(inner_allocator),
+                        .index => diff_state.index.deinit(inner_allocator),
+                        .tree => diff_state.tree.deinit(),
+                    }
+                }
+            };
+            var diff_state: DiffState = switch (diff_cmd) {
+                .work_dir => .{ .work_dir = try repo.status(io, allocator) },
+                .index => .{ .index = try repo.status(io, allocator) },
+                .tree => |tree| .{
+                    .tree = try repo.treeDiff(io, allocator, if (tree.old) |old| &old else null, if (tree.new) |new| &new else null),
+                },
+            };
+            defer diff_state.deinit(allocator);
+            var diff_iter = try repo.filePairs(io, allocator, switch (diff_cmd) {
+                .work_dir => |work_dir| .{
+                    .work_dir = .{
+                        .conflict_diff_kind = work_dir.conflict_diff_kind,
+                        .status = &diff_state.work_dir,
+                    },
+                },
+                .index => .{
+                    .index = .{ .status = &diff_state.index },
+                },
+                .tree => .{
+                    .tree = .{ .tree_diff = &diff_state.tree },
+                },
+            });
+
+            while (try diff_iter.next()) |*line_iter_pair_ptr| {
+                var line_iter_pair = line_iter_pair_ptr.*;
+                defer line_iter_pair.deinit();
+                var hunk_iter = try df.HunkIterator(repo_kind, repo_opts).init(allocator, &line_iter_pair.a, &line_iter_pair.b);
+                defer hunk_iter.deinit(allocator);
+                for (hunk_iter.header_lines.items) |header_line| {
+                    if (run_opts.color) try term.writeStyle(run_opts.out, .{ .bold = true });
+                    try run_opts.out.print("{s}", .{header_line});
+                    if (run_opts.color) try term.attributeReset(run_opts.out);
+                    try run_opts.out.writeAll("\n");
+                }
+                while (try hunk_iter.next(allocator)) |*hunk_ptr| {
+                    var hunk = hunk_ptr.*;
+                    defer hunk.deinit(allocator);
+                    try hunk_iter.writeHunk(&hunk, run_opts.out, run_opts.color);
+                }
+            }
+        },
+        .branch => |branch_cmd| {
+            switch (branch_cmd) {
+                .list => {
+                    var head_buffer: [rf.MAX_REF_CONTENT_SIZE]u8 = @splat(0);
+                    const current_branch_name = switch (try repo.head(io, &head_buffer)) {
+                        .ref => |ref| ref.name,
+                        .oid => "",
+                    };
+
+                    var ref_iter = try repo.listBranches(io, allocator, .beginning);
+                    defer ref_iter.deinit();
+
+                    while (try ref_iter.next()) |ref| {
+                        const prefix = if (std.mem.eql(u8, current_branch_name, ref.name)) "*" else " ";
+                        try run_opts.out.print("{s} {s}\n", .{ prefix, ref.name });
+                    }
+                },
+                .add => |add_branch| try repo.addBranch(io, add_branch),
+                .remove => |rm_branch| try repo.removeBranch(io, rm_branch),
+            }
+        },
+        .switch_dir, .reset, .reset_dir => |switch_dir_cmd| {
+            var switch_result = try repo.switchDir(io, allocator, switch_dir_cmd);
+            defer switch_result.deinit();
+            switch (switch_result.result) {
+                .success => {},
+                .conflict => |conflict| {
+                    try run_opts.err.print(
+                        \\conflicts detected in the following file paths:
+                        \\
+                    , .{});
+                    for (conflict.stale_files.keys()) |path| {
+                        try run_opts.err.print("  {s}\n", .{path});
+                    }
+                    for (conflict.stale_dirs.keys()) |path| {
+                        try run_opts.err.print("  {s}\n", .{path});
+                    }
+                    for (conflict.untracked_overwritten.keys()) |path| {
+                        try run_opts.err.print("  {s}\n", .{path});
+                    }
+                    for (conflict.untracked_removed.keys()) |path| {
+                        try run_opts.err.print("  {s}\n", .{path});
+                    }
+                    try run_opts.err.print("if you really want to continue, throw caution into the wind by adding the -f flag\n", .{});
+                    return error.HandledError;
+                },
+            }
+        },
+        .reset_add => |reset_add_cmd| try repo.resetAdd(io, reset_add_cmd),
+        .restore => |restore_cmd| try repo.restore(io, allocator, restore_cmd.path),
+        .log => |heads| {
+            var start_oids = try std.ArrayList([hash.hexLen(repo_opts.hash)]u8).initCapacity(allocator, heads.len);
+            defer start_oids.deinit(allocator);
+            for (heads) |ref_or_oid| {
+                const oid_maybe = switch (ref_or_oid) {
+                    .ref => |ref| try repo.readRef(io, ref),
+                    .oid => |oid| oid.*,
+                };
+                const oid = oid_maybe orelse {
+                    var ref_path_buffer: [rf.MAX_REF_CONTENT_SIZE]u8 = @splat(0);
+                    try run_opts.err.print("invalid ref: {s}\n", .{switch (ref_or_oid) {
+                        .oid => |oid| oid,
+                        .ref => |ref| try ref.toPath(&ref_path_buffer),
+                    }});
+                    return error.HandledError;
+                };
+                start_oids.appendAssumeCapacity(oid);
+            }
+
+            var commit_iter = try repo.log(io, allocator, .{ .start_oids = if (start_oids.items.len > 0) start_oids.items else null });
+            defer commit_iter.deinit();
+            while (try commit_iter.next(allocator)) |commit_object| {
+                defer commit_object.deinit();
+                try run_opts.out.print("commit {s}\n", .{commit_object.oid});
+                if (commit_object.content.commit.metadata.author) |author| {
+                    try run_opts.out.print("author: {s}\n", .{author});
+                }
+                try run_opts.out.print("\n", .{});
+
+                var message: std.ArrayList(u8) = .empty;
+                defer message.deinit(allocator);
+                try commit_object.readMessage(allocator, &message, .unlimited);
+
+                // for each line...
+                var lines = std.mem.splitScalar(u8, message.items, '\n');
+                while (lines.next()) |line| {
+                    // the last piece is empty when the message ends in a newline
+                    if (line.len == 0 and lines.peek() == null) break;
+                    try run_opts.out.print("    {s}\n", .{line});
+                }
+
+                try run_opts.out.print("\n", .{});
+            }
+        },
+        .merge, .cherry_pick => |merge_cmd| {
+            var clear_line = false;
+            var progress_node: ?std.Progress.Node = null;
+            var result = try repo.merge(
+                io,
+                allocator,
+                merge_cmd,
+                if (repo_opts.ProgressCtx == void) {} else .{ .run_opts = run_opts, .clear_line = &clear_line, .node = &progress_node },
+            );
+            endProgress();
+            defer result.deinit();
+            try printMergeResult(repo_kind, repo_opts, &result, run_opts);
+        },
+        .config => |config_cmd| switch (config_cmd) {
+            .list => {
+                var conf = try repo.listConfig(io, allocator);
+                defer conf.deinit();
+
+                for (conf.sections.keys(), conf.sections.values()) |section_name, variables| {
+                    for (variables.keys(), variables.values()) |name, value| {
+                        try run_opts.out.print("{s}.{s}={s}\n", .{ section_name, name, value });
+                    }
+                }
+            },
+            .add => |config_add_cmd| try repo.addConfig(io, allocator, config_add_cmd),
+            .remove => |config_remove_cmd| try repo.removeConfig(io, allocator, config_remove_cmd),
+        },
+        .remote => |remote_cmd| switch (remote_cmd) {
+            .list => {
+                var rem = try repo.listRemotes(io, allocator);
+                defer rem.deinit();
+
+                for (rem.sections.keys(), rem.sections.values()) |section_name, variables| {
+                    for (variables.keys(), variables.values()) |name, value| {
+                        try run_opts.out.print("{s}.{s}={s}\n", .{ section_name, name, value });
+                    }
+                }
+            },
+            .add => |remote_add_cmd| try repo.addRemote(io, allocator, remote_add_cmd),
+            .remove => |remote_remove_cmd| try repo.removeRemote(io, allocator, remote_remove_cmd),
+        },
+        .gc => switch (repo_kind) {
+            .git => {
+                try run_opts.err.print("command not valid for this backend\n", .{});
+                return error.HandledError;
+            },
+            .xit => {
+                var clear_line = false;
+                var progress_node: ?std.Progress.Node = null;
+                const result = try repo.garbageCollect(
+                    io,
+                    allocator,
+                    .{},
+                    if (repo_opts.ProgressCtx == void) {} else .{ .run_opts = run_opts, .clear_line = &clear_line, .node = &progress_node },
+                );
+                endProgress();
+                try run_opts.out.print(
+                    \\.xit/db: {} -> {} bytes
+                    \\
+                , .{
+                    result.size_before,
+                    result.size_after,
+                });
+            },
+        },
+        .clone => {},
+        .fetch => |fetch_cmd| {
+            var clear_line = false;
+            var progress_node: ?std.Progress.Node = null;
+            var refspecs = try std.ArrayList([]const u8).initCapacity(allocator, fetch_cmd.refspec_strs.len);
+            defer {
+                for (refspecs.items) |refspec| allocator.free(refspec);
+                refspecs.deinit(allocator);
+            }
+            for (fetch_cmd.refspec_strs) |refspec_str| {
+                var refspec = try net_refspec.RefSpec.init(allocator, refspec_str, .fetch);
+                defer refspec.deinit(allocator);
+                // Use the same name as src if not specified
+                if (refspec.dst.len == 0) {
+                    allocator.free(refspec.dst);
+                    refspec.dst = try allocator.dupe(u8, refspec.src);
+                }
+                const refspec_normalized = try refspec.normalize(allocator);
+                refspecs.appendAssumeCapacity(refspec_normalized);
+            }
+
+            try repo.fetch(
+                io,
+                allocator,
+                fetch_cmd.remote_name,
+                .{
+                    .progress_ctx = if (repo_opts.ProgressCtx == void) {} else .{ .run_opts = run_opts, .clear_line = &clear_line, .node = &progress_node },
+                    .refspecs = if (refspecs.items.len > 0) refspecs.items else null,
+                },
+            );
+        },
+        .push => |push_cmd| {
+            var clear_line = false;
+            var progress_node: ?std.Progress.Node = null;
+            try repo.push(
+                io,
+                allocator,
+                push_cmd.remote_name,
+                push_cmd.refspec,
+                push_cmd.force,
+                .{ .progress_ctx = if (repo_opts.ProgressCtx == void) {} else .{ .run_opts = run_opts, .clear_line = &clear_line, .node = &progress_node } },
+            );
+        },
+        .upload_pack => |upload_pack_cmd| {
+            var options = upload_pack_cmd.options;
+            options.protocol_version = server_common.parseProtocolVersion(run_opts.environ_map.get("GIT_PROTOCOL"));
+            var stdin_buf: [repo_opts.net_buffer_size]u8 = undefined;
+            var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buf);
+            var stdout_buf: [repo_opts.net_buffer_size]u8 = undefined;
+            var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
+            // stdout here is the wire protocol, not a terminal to draw on
+            try repo.uploadPack(io, allocator, &stdin_reader.interface, &stdout_writer.interface, options, null);
+        },
+        .receive_pack => |receive_pack_cmd| {
+            var options = receive_pack_cmd.options;
+            options.protocol_version = server_common.parseProtocolVersion(run_opts.environ_map.get("GIT_PROTOCOL"));
+            var stdin_buf: [repo_opts.net_buffer_size]u8 = undefined;
+            var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buf);
+            var stdout_buf: [repo_opts.net_buffer_size]u8 = undefined;
+            var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
+            // stdout here is the wire protocol, not a terminal to draw on
+            try repo.receivePack(io, allocator, &stdin_reader.interface, &stdout_writer.interface, options, null);
+        },
+        .http_backend => {
+            const environ_map = run_opts.environ_map;
+            var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const path = try server_http_backend.resolveRepoPath(environ_map, &path_buf);
+
+            var stdout_buf: [repo_opts.net_buffer_size]u8 = undefined;
+            var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
+
+            const handler, const suffix = for (&server_http_backend.routes) |*svc| {
+                if (std.mem.endsWith(u8, path, svc.suffix))
+                    break .{ svc.handler, svc.suffix };
+            } else {
+                try server_http_backend.sendNotFound(&stdout_writer.interface);
+                return;
+            };
+
+            const request_method: std.http.Method = blk: {
+                const method_str = environ_map.get("REQUEST_METHOD") orelse break :blk .GET;
+                const method = std.meta.stringToEnum(std.http.Method, method_str) orelse break :blk .GET;
+                break :blk if (method == .HEAD) .GET else method;
+            };
+
+            var stdin_buf: [repo_opts.net_buffer_size]u8 = undefined;
+            var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buf);
+            try repo.httpBackend(io, allocator, &stdin_reader.interface, &stdout_writer.interface, .cgi, .{
+                .request_method = request_method,
+                .handler = handler,
+                .suffix = suffix,
+                .query_string = environ_map.get("QUERY_STRING") orelse "",
+                .content_type = environ_map.get("CONTENT_TYPE") orelse "",
+                .has_remote_user = environ_map.get("REMOTE_USER") != null,
+                .protocol_version = server_common.parseProtocolVersion(environ_map.get("GIT_PROTOCOL")),
+            }, null);
+        },
+        .patch => |patch_cmd| switch (repo_kind) {
+            .git => {
+                try run_opts.err.print("command not valid for this backend\n", .{});
+                return error.HandledError;
+            },
+            .xit => switch (patch_cmd) {
+                .on => try repo.setMergeAlgorithm(io, allocator, .patch),
+                .off => try repo.setMergeAlgorithm(io, allocator, .diff3),
+                .all => {
+                    var clear_line = false;
+                    var progress_node: ?std.Progress.Node = null;
+                    try repo.patchAll(
+                        io,
+                        allocator,
+                        if (repo_opts.ProgressCtx == void) {} else .{ .run_opts = run_opts, .clear_line = &clear_line, .node = &progress_node },
+                    );
+                },
+            },
+        },
+    }
+}
+
+fn printMergeResult(
+    comptime repo_kind: rp.RepoKind,
+    comptime repo_opts: rp.RepoOpts(repo_kind),
+    merge_result: *const mrg.Merge(repo_kind, repo_opts),
+    run_opts: RunOpts,
+) !void {
+    for (merge_result.auto_resolved_conflicts.keys()) |path| {
+        if (merge_result.changes.contains(path)) {
+            try run_opts.out.print("auto-merging {s}\n", .{path});
+        }
+    }
+    switch (merge_result.result) {
+        .success, .clean => {},
+        .nothing => {
+            try run_opts.out.print("already up to date\n", .{});
+        },
+        .fast_forward => {
+            try run_opts.out.print("fast-forward\n", .{});
+        },
+        .conflict => |result_conflict| {
+            for (result_conflict.conflicts.keys(), result_conflict.conflicts.values()) |path, conflict| {
+                if (conflict.renamed) |renamed| {
+                    const conflict_type = if (conflict.target != null)
+                        "file/directory"
+                    else
+                        "directory/file";
+                    const dir_branch_name = if (conflict.target != null)
+                        merge_result.source_name
+                    else
+                        merge_result.target_name;
+                    try run_opts.err.print("CONFLICT ({s}): there is a directory with name {s} in {s}. adding {s} as {s}\n", .{ conflict_type, path, dir_branch_name, path, renamed.path });
+                } else {
+                    if (merge_result.changes.contains(path)) {
+                        try run_opts.out.print("auto-merging {s}\n", .{path});
+                    }
+                    if (conflict.target != null and conflict.source != null) {
+                        const conflict_type = if (conflict.base != null)
+                            "content"
+                        else
+                            "add/add";
+                        try run_opts.err.print("CONFLICT ({s}): merge conflict in {s}\n", .{ conflict_type, path });
+                    } else {
+                        const conflict_type = if (conflict.target != null)
+                            "modify/delete"
+                        else
+                            "delete/modify";
+                        const deleted_branch_name, const modified_branch_name = if (conflict.target != null)
+                            .{ merge_result.source_name, merge_result.target_name }
+                        else
+                            .{ merge_result.target_name, merge_result.source_name };
+                        try run_opts.err.print("CONFLICT ({s}): {s} deleted in {s} and modified in {s}\n", .{ conflict_type, path, deleted_branch_name, modified_branch_name });
+                    }
+                }
+            }
+            return error.HandledError;
+        },
+    }
+}
+
+/// this is the main "main". it's even mainier than "run".
+/// this is the real deal. there is no main more main than this.
+/// at least, not that i know of. i guess internally zig probably
+/// has an earlier entrypoint which is even mainier than this.
+pub fn main(init: std.process.Init) !u8 {
+    var safe_allocator: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
+    const allocator = if (builtin.optimize == .debug) safe_allocator.allocator() else std.heap.smp_allocator;
+    defer if (builtin.optimize == .debug) {
+        _ = safe_allocator.deinit();
+    };
+
+    var threaded = std.Io.Threaded.init(allocator, .{
+        .environ = init.minimal.environ,
+    });
+    defer threaded.deinit();
+    const io = threaded.io();
+    defer endProgress();
+
+    var args: std.ArrayList([]const u8) = .empty;
+    defer args.deinit(allocator);
+
+    var arg_it = try init.minimal.args.iterateAllocator(allocator);
+    defer arg_it.deinit();
+    _ = arg_it.skip();
+    while (arg_it.next()) |arg| {
+        try args.append(allocator, arg);
+    }
+
+    var stdout_writer = std.Io.File.stdout().writer(io, &.{});
+    var stderr_writer = std.Io.File.stderr().writer(io, &.{});
+    const run_opts = RunOpts{
+        .out = &stdout_writer.interface,
+        .err = &stderr_writer.interface,
+        .environ_map = init.environ_map,
+        .color = std.mem.eql(u8, init.environ_map.get("NO_COLOR") orelse "", "") and try std.Io.File.stdout().isTty(io),
+    };
+
+    const cwd_path = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd_path);
+
+    runPrint(.xit, .{
+        .ProgressCtx = ProgressCtx,
+        .max_hunk_edits = null, // printed diffs stay applicable by git apply
+    }, io, allocator, args.items, cwd_path, run_opts) catch |err| switch (err) {
+        error.HandledError => return 1,
+        // the reader closed stdout early (like quitting `less`), so stop quietly
+        error.WriteFailed => if (stdout_writer.err) |write_err| switch (write_err) {
+            error.BrokenPipe => return 0,
+            else => return err,
+        } else return err,
+        else => |e| return e,
+    };
+
+    return 0;
+}

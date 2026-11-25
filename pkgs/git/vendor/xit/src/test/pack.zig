@@ -1,0 +1,459 @@
+const std = @import("std");
+const hash = @import("../hash.zig");
+const rp = @import("../repo.zig");
+const obj = @import("../object.zig");
+const pack = @import("../pack.zig");
+const rf = @import("../ref.zig");
+
+// createDelta's output bytes are validated end-to-end in the
+// "write pack file" test below, which reads the deltas back with
+// PackObjectReader. this test just checks its compression behavior.
+test "create delta" {
+    const allocator = std.testing.allocator;
+
+    // an edit in the middle of similar content should produce a delta
+    // much smaller than the content itself
+    const base = repeat("the quick brown fox jumps over the lazy dog. ", 50);
+    const target = base[0..1000] ++ "EDITED!" ++ base[1000..];
+    const delta = (try pack.createDelta(allocator, base, target, target.len / 2)) orelse return error.NoDelta;
+    defer allocator.free(delta);
+    try std.testing.expect(delta.len < 100);
+
+    // unrelated content can't be delta-compressed within the size budget
+    var random_bytes: [1000]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(123);
+    prng.random().bytes(&random_bytes);
+    try std.testing.expectEqual(null, try pack.createDelta(allocator, base, &random_bytes, random_bytes.len / 2));
+}
+
+test "create and read pack" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const repo_opts = rp.RepoOpts(.git){ .is_test = true };
+
+    // create the temp dir
+    const cwd = std.Io.Dir.cwd();
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const temp_path = try temp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(temp_path);
+
+    // get work dir path
+    const work_path = try std.Io.Dir.path.join(allocator, &.{ temp_path, "repo" });
+    defer allocator.free(work_path);
+
+    // create the work dir
+    var work_dir = try cwd.createDirPathOpen(io, work_path, .{});
+    defer work_dir.close(io);
+
+    // init repo
+    var repo = try rp.Repo(.git, repo_opts).init(io, allocator, .{ .path = work_path });
+    defer repo.deinit(io, allocator);
+
+    // make sure the git dir was created
+    var repo_dir = try work_dir.openDir(io, ".git", .{});
+    defer repo_dir.close(io);
+
+    // add and commit
+    var commit_oid1: [hash.hexLen(repo_opts.hash)]u8 = undefined;
+    {
+        // make file
+        var hello_txt = try work_dir.createFile(io, "hello.txt", .{});
+        defer hello_txt.close(io);
+        try hello_txt.writeStreamingAll(io, "hello, world!");
+
+        // make file
+        var readme = try work_dir.createFile(io, "README", .{});
+        defer readme.close(io);
+        try readme.writeStreamingAll(io, "My cool project");
+
+        // add the files
+        try repo.add(io, allocator, &.{ "hello.txt", "README" });
+
+        // make the commit
+        commit_oid1 = try repo.commit(io, allocator, .{ .message = "let there be light" });
+    }
+
+    // add and commit
+    var commit_oid2: [hash.hexLen(repo_opts.hash)]u8 = undefined;
+    {
+        // make files
+        var license = try work_dir.createFile(io, "LICENSE", .{});
+        defer license.close(io);
+        try license.writeStreamingAll(io, "do whatever you want");
+        var change_log = try work_dir.createFile(io, "CHANGELOG", .{});
+        defer change_log.close(io);
+        try change_log.writeStreamingAll(io, "cha-cha-cha-changes");
+
+        // change file
+        const hello_txt = try work_dir.openFile(io, "hello.txt", .{ .mode = .read_write });
+        defer hello_txt.close(io);
+        try hello_txt.setLength(io, 0);
+        try hello_txt.writeStreamingAll(io, "goodbye, world!");
+
+        // add the files
+        try repo.add(io, allocator, &.{ "LICENSE", "CHANGELOG", "hello.txt" });
+
+        // make the commit
+        commit_oid2 = try repo.commit(io, allocator, .{ .message = "add license" });
+    }
+
+    // write and read a pack object
+    {
+        var r = try rp.Repo(.git, repo_opts).open(io, allocator, .{ .path = work_path });
+        defer r.deinit(io, allocator);
+
+        const head_oid = try rf.readHeadRecur(.git, repo_opts, .{ .core = &r.core, .extra = .{} }, io);
+
+        var pack_writer = try pack.PackWriter(.git, repo_opts).init(allocator, .{ .core = &r.core, .extra = .{} }, io, &.{head_oid}, &.{}, null) orelse return error.PackWriterIsEmpty;
+        defer pack_writer.deinit();
+
+        var pack_file = try temp.dir.createFile(io, "test.pack", .{});
+        defer pack_file.close(io);
+
+        var buffer: [1]u8 = @splat(0);
+        while (true) {
+            const size = try pack_writer.read(&buffer);
+            try pack_file.writeStreamingAll(io, buffer[0..size]);
+            if (size < buffer.len) {
+                break;
+            }
+        }
+
+        for (&[_]*const [hash.hexLen(repo_opts.hash)]u8{ &commit_oid1, &commit_oid2 }) |commit_oid_hex| {
+            var pack_reader = try pack.PackReader.initFile(io, allocator, temp.dir, "test.pack");
+            defer pack_reader.deinit();
+
+            var pack_obj_rdr = try pack.PackObjectReader(.git, repo_opts).initWithoutIndex(io, allocator, .{ .core = &r.core, .extra = .{} }, &pack_reader, commit_oid_hex);
+            defer pack_obj_rdr.deinit(io, allocator);
+
+            // make sure the reader's position is at the beginning
+            try std.testing.expectEqual(0, pack_obj_rdr.relative_position);
+        }
+    }
+}
+
+test "write pack file" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const repo_opts = rp.RepoOpts(.git){ .is_test = true };
+
+    // create the temp dir
+    const cwd = std.Io.Dir.cwd();
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const temp_path = try temp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(temp_path);
+
+    const client_path = try std.Io.Dir.path.join(allocator, &.{ temp_path, "client" });
+    defer allocator.free(client_path);
+
+    var client_repo = try rp.Repo(.git, repo_opts).init(io, allocator, .{ .path = client_path });
+    defer client_repo.deinit(io, allocator);
+
+    var client_dir = try cwd.openDir(io, client_path, .{});
+    defer client_dir.close(io);
+
+    // copy files from current repo into client dir
+    for (&[_][]const u8{ "src", "docs" }) |dir_name| {
+        var src_repo_dir = try cwd.openDir(io, dir_name, .{ .iterate = true });
+        defer src_repo_dir.close(io);
+
+        var dest_repo_dir = try client_dir.createDirPathOpen(io, dir_name, .{});
+        defer dest_repo_dir.close(io);
+
+        try copyDir(io, src_repo_dir, dest_repo_dir);
+
+        try client_repo.add(io, allocator, &.{dir_name});
+    }
+
+    _ = try client_repo.commit(io, allocator, .{ .message = "let there be light" });
+
+    // change the files so git will send them as delta objects
+    for (&[_][]const u8{ "src", "docs" }) |dir_name| {
+        var dest_repo_dir = try client_dir.createDirPathOpen(io, dir_name, .{ .open_options = .{ .iterate = true } });
+        defer dest_repo_dir.close(io);
+
+        {
+            var iter = dest_repo_dir.iterate();
+            while (try iter.next(io)) |entry| {
+                switch (entry.kind) {
+                    .file => {
+                        const file = try dest_repo_dir.openFile(io, entry.name, .{ .mode = .read_write });
+                        defer file.close(io);
+                        var writer = file.writer(io, &.{});
+                        try writer.interface.writeAll("EDIT");
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        try client_repo.add(io, allocator, &.{dir_name});
+    }
+
+    const commit2 = try client_repo.commit(io, allocator, .{ .message = "more stuff" });
+
+    var pack_file = try temp.dir.createFile(io, "test.pack", .{});
+    defer pack_file.close(io);
+
+    // write pack file
+    var pack_writer_maybe = try pack.PackWriter(.git, repo_opts).init(allocator, .{ .core = &client_repo.core, .extra = .{} }, io, &.{commit2}, &.{}, null);
+    if (pack_writer_maybe) |*pack_writer| {
+        defer pack_writer.deinit();
+
+        var read_buffer: [repo_opts.read_size]u8 = @splat(0);
+
+        while (true) {
+            const size = try pack_writer.read(&read_buffer);
+            if (size == 0) {
+                break;
+            }
+
+            const pack_data = read_buffer[0..size];
+            try pack_file.writeStreamingAll(io, pack_data);
+        }
+    }
+
+    // make sure the pack file is valid
+    {
+        const server_path = try std.Io.Dir.path.join(allocator, &.{ temp_path, "server" });
+        defer allocator.free(server_path);
+
+        var server_repo = try rp.Repo(.git, .{ .is_test = true }).init(io, allocator, .{ .path = server_path });
+        defer server_repo.deinit(io, allocator);
+
+        {
+            var pack_reader = try pack.PackReader.initFile(io, allocator, temp.dir, "test.pack");
+            defer pack_reader.deinit();
+
+            var pack_iter = try pack.PackIterator(.git, repo_opts).init(io, allocator, &pack_reader);
+            try obj.copyFromPackIterator(.git, repo_opts, .{ .core = &server_repo.core, .extra = .{} }, io, allocator, &pack_iter, null, false);
+        }
+
+        // since the second commit only edited existing files, the pack
+        // should contain delta objects
+        var object_count: usize = 0;
+        {
+            var pack_reader = try pack.PackReader.initFile(io, allocator, temp.dir, "test.pack");
+            defer pack_reader.deinit();
+
+            var pack_iter = try pack.PackIterator(.git, repo_opts).init(io, allocator, &pack_reader);
+
+            var delta_count: usize = 0;
+            while (try pack_iter.next(.{ .core = &server_repo.core, .extra = .{} }, null)) |pack_obj_rdr| {
+                defer pack_obj_rdr.deinit(io, allocator);
+
+                object_count += 1;
+                switch (pack_obj_rdr.internal) {
+                    .basic => {},
+                    .delta => delta_count += 1,
+                }
+
+                // drain the object so the iterator can advance
+                var drain_buffer: [1024]u8 = @splat(0);
+                while (0 != try pack_obj_rdr.read(&drain_buffer)) {}
+            }
+            try std.testing.expect(delta_count > 0);
+        }
+
+        // walking the copied objects verifies that every delta was
+        // reconstructed correctly: a corrupted object would have been
+        // stored under a different oid than the one its parent refers to,
+        // so the walk would fail to find it
+        {
+            var walk_iter = try obj.ObjectIterator(.git, repo_opts).init(.{ .core = &server_repo.core, .extra = .{} }, io, allocator, .{ .kind = .all });
+            defer walk_iter.deinit();
+            try walk_iter.include(&commit2);
+
+            var walk_count: usize = 0;
+            while (try walk_iter.next(allocator)) |object| {
+                object.deinit();
+                walk_count += 1;
+            }
+            try std.testing.expectEqual(object_count, walk_count);
+        }
+    }
+}
+
+fn copyDir(io: std.Io, src_dir: std.Io.Dir, dest_dir: std.Io.Dir) !void {
+    var iter = src_dir.iterate();
+    while (try iter.next(io)) |entry| {
+        switch (entry.kind) {
+            .file => try src_dir.copyFile(entry.name, dest_dir, entry.name, io, .{}),
+            .directory => {
+                try dest_dir.createDirPath(io, entry.name);
+                var dest_entry_dir = try dest_dir.openDir(io, entry.name, .{ .access_sub_paths = true, .iterate = true, .follow_symlinks = false });
+                defer dest_entry_dir.close(io);
+                var src_entry_dir = try src_dir.openDir(io, entry.name, .{ .access_sub_paths = true, .iterate = true, .follow_symlinks = false });
+                defer src_entry_dir.close(io);
+                try copyDir(io, src_entry_dir, dest_entry_dir);
+            },
+            else => {},
+        }
+    }
+}
+
+test "iterate pack from file" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const repo_opts = rp.RepoOpts(.git){ .is_test = true };
+
+    // create the temp dir
+    const cwd = std.Io.Dir.cwd();
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const temp_path = try temp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(temp_path);
+
+    // get work dir path
+    const work_path = try std.Io.Dir.path.join(allocator, &.{ temp_path, "repo" });
+    defer allocator.free(work_path);
+
+    var r = try rp.Repo(.git, repo_opts).init(io, allocator, .{ .path = work_path });
+    defer r.deinit(io, allocator);
+
+    var pack_dir = try cwd.openDir(io, "src/test/data", .{});
+    defer pack_dir.close(io);
+
+    var pack_reader = try pack.PackReader.initFile(io, allocator, pack_dir, "pack-b7f085e431fc05b0bca3d5c306dc148d7bbed2f4.pack");
+    defer pack_reader.deinit();
+
+    var pack_iter = try pack.PackIterator(.git, repo_opts).init(io, allocator, &pack_reader);
+
+    try obj.copyFromPackIterator(.git, repo_opts, .{ .core = &r.core, .extra = .{} }, io, allocator, &pack_iter, null, false);
+}
+
+test "iterate pack from stream" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const repo_opts = rp.RepoOpts(.git){ .is_test = true };
+
+    // create the temp dir
+    const cwd = std.Io.Dir.cwd();
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const temp_path = try temp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(temp_path);
+
+    // get work dir path
+    const work_path = try std.Io.Dir.path.join(allocator, &.{ temp_path, "repo" });
+    defer allocator.free(work_path);
+
+    var r = try rp.Repo(.git, repo_opts).init(io, allocator, .{ .path = work_path });
+    defer r.deinit(io, allocator);
+
+    var pack_dir = try cwd.openDir(io, "src/test/data", .{});
+    defer pack_dir.close(io);
+
+    const pack_file = try pack_dir.openFile(io, "pack-b7f085e431fc05b0bca3d5c306dc148d7bbed2f4.pack", .{ .mode = .read_only });
+    defer pack_file.close(io);
+
+    var buffer: [repo_opts.buffer_size]u8 = undefined;
+    var reader = pack_file.reader(io, &buffer);
+
+    var counting_buf: [repo_opts.buffer_size]u8 = undefined;
+    var counting_reader = pack.CountingReader.init(&reader.interface, &counting_buf);
+    var pack_reader = pack.PackReader.initStream(&counting_reader);
+    defer pack_reader.deinit();
+
+    var pack_iter = try pack.PackIterator(.git, repo_opts).init(io, allocator, &pack_reader);
+
+    try obj.copyFromPackIterator(.git, repo_opts, .{ .core = &r.core, .extra = .{} }, io, allocator, &pack_iter, null, false);
+}
+
+test "read packed refs" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const repo_opts = rp.RepoOpts(.git){ .is_test = true };
+
+    // create the temp dir
+    const cwd = std.Io.Dir.cwd();
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const temp_path = try temp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(temp_path);
+
+    // get work dir path
+    const work_path = try std.Io.Dir.path.join(allocator, &.{ temp_path, "repo" });
+    defer allocator.free(work_path);
+
+    // create the work dir
+    var work_dir = try cwd.createDirPathOpen(io, work_path, .{});
+    defer work_dir.close(io);
+
+    var r = try rp.Repo(.git, repo_opts).init(io, allocator, .{ .path = work_path });
+    defer r.deinit(io, allocator);
+
+    // make sure the git dir was created
+    var repo_dir = try work_dir.openDir(io, ".git", .{});
+    defer repo_dir.close(io);
+
+    var packed_refs = try repo_dir.createFile(io, "packed-refs", .{});
+    defer packed_refs.close(io);
+    try packed_refs.writeStreamingAll(io,
+        \\# pack-refs with: peeled fully-peeled sorted
+        \\5246e54744f4e1824ca280e6a2630a87959d7cf4 refs/heads/master
+        \\1ea47a890400815b24a0073f110a41530322a44f refs/heads/feature/one
+        \\1f6190c71bd33b37cfd885491889a0410f849f5b refs/tags/1.0.0
+        \\5246e54744f4e1824ca280e6a2630a87959d7cf4 refs/remotes/origin/master
+        \\1ea47a890400815b24a0073f110a41530322a44f refs/remotes/sync/chunk
+        \\5246e54744f4e1824ca280e6a2630a87959d7cf4 refs/remotes/sync/master
+        \\1f6190c71bd33b37cfd885491889a0410f849f5b refs/remotes/sync/zig-0.14.0
+    );
+
+    const oid_maybe = try r.readRef(io, .{ .kind = .{ .remote = "sync" }, .name = "master" });
+    try std.testing.expectEqualStrings("5246e54744f4e1824ca280e6a2630a87959d7cf4", &oid_maybe.?);
+
+    try std.testing.expect(null == try r.readRef(io, .{ .kind = .{ .remote = "sync" }, .name = "foo" }));
+
+    // iterating branches and tags includes packed refs, in sorted order
+    {
+        var branch_iter = try r.listBranches(io, allocator, .beginning);
+        defer branch_iter.deinit();
+        try std.testing.expectEqualStrings("feature/one", ((try branch_iter.next()) orelse return error.RefNotFound).name);
+        try std.testing.expectEqualStrings("master", ((try branch_iter.next()) orelse return error.RefNotFound).name);
+        try std.testing.expect(null == try branch_iter.next());
+
+        var tag_iter = try r.listTags(io, allocator, .beginning);
+        defer tag_iter.deinit();
+        try std.testing.expectEqualStrings("1.0.0", ((try tag_iter.next()) orelse return error.RefNotFound).name);
+        try std.testing.expect(null == try tag_iter.next());
+    }
+
+    // a loose ref with the same name as a packed ref is only emitted once
+    {
+        var heads_dir = try repo_dir.createDirPathOpen(io, "refs/heads", .{});
+        defer heads_dir.close(io);
+        var master_file = try heads_dir.createFile(io, "master", .{});
+        defer master_file.close(io);
+        try master_file.writeStreamingAll(io, "1ea47a890400815b24a0073f110a41530322a44f\n");
+
+        var branch_iter = try r.listBranches(io, allocator, .beginning);
+        defer branch_iter.deinit();
+        try std.testing.expectEqualStrings("feature/one", ((try branch_iter.next()) orelse return error.RefNotFound).name);
+        try std.testing.expectEqualStrings("master", ((try branch_iter.next()) orelse return error.RefNotFound).name);
+        try std.testing.expect(null == try branch_iter.next());
+    }
+
+    // start iterating from a key or index
+    {
+        var key_iter = try r.listBranches(io, allocator, .{ .key = "master" });
+        defer key_iter.deinit();
+        try std.testing.expectEqualStrings("master", ((try key_iter.next()) orelse return error.RefNotFound).name);
+        try std.testing.expect(null == try key_iter.next());
+
+        var index_iter = try r.listBranches(io, allocator, .{ .index = 1 });
+        defer index_iter.deinit();
+        try std.testing.expectEqualStrings("master", ((try index_iter.next()) orelse return error.RefNotFound).name);
+        try std.testing.expect(null == try index_iter.next());
+    }
+}
+
+/// replacement for the removed `"str" ** n` syntax
+fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
+    return comptime blk: {
+        const chunks: [n][s.len]u8 = @splat(s[0..s.len].*);
+        break :blk @ptrCast(&chunks);
+    };
+}

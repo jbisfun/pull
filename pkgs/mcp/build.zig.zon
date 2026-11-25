@@ -1,0 +1,24 @@
+.{
+    .name = .pull_mcp,
+    .version = "0.1.0",
+    .fingerprint = 0x9962eac7687a2974,
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .core = .{ .path = "../core" },
+        .git = .{ .path = "../git" },
+        .launchd = .{ .path = "../launchd", .lazy = true },
+        .parley = .{
+            .url = "git+https://github.com/pedronaugusto/parley#3dffee3a0e074d6cfb5be647f5a4694c2fd9ad9d",
+            .hash = "parley-0.8.0-x3fwY1idCwCLQPMDQif0tjRyIbXpzYaMJ2l0mVuqHSUp",
+        },
+        .sweep = .{
+            .url = "git+https://github.com/pedronaugusto/sweep#20b14429efbffe8eb1f6b185a85c79fe29939260",
+            .hash = "sweep-0.4.1-6ErwacOHCACjOGrLL7xD_wX8CbOLtowuP5CG1DCGHlfX",
+        },
+        .regex = .{
+            .url = "git+https://github.com/quangd42/regex.zig#3c288bff714c49ef0d784576fa31326b1cd132a9",
+            .hash = "regex-0.2.0-V8KKSbtOBAC4Ep5oLpop1UhJFISeaxyk3kCBSzjewAqL",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

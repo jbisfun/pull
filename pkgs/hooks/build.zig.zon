@@ -1,0 +1,10 @@
+.{
+    .name = .pull_hooks,
+    .version = "0.1.0",
+    .fingerprint = 0x5ff4871d26b2e35f,
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .core = .{ .path = "../core" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

@@ -1,0 +1,280 @@
+const std = @import("std");
+const xitui = @import("xitui");
+const wgt = xitui.widget;
+const layout = xitui.layout;
+const Key = xitui.input.Key;
+const Grid = xitui.grid.Grid;
+const Focus = xitui.focus.Focus;
+const rp = @import("../repo.zig");
+const df = @import("../diff.zig");
+
+pub fn Diff(comptime Widget: type, comptime repo_kind: rp.RepoKind, comptime repo_opts: rp.RepoOpts(repo_kind)) type {
+    return struct {
+        box: wgt.Box(Widget),
+        repo: *rp.Repo(repo_kind, repo_opts),
+        iter_arena: std.heap.ArenaAllocator,
+        file_iter: ?df.FileIterator(repo_kind, repo_opts),
+        hunk_iter: ?df.HunkIterator(repo_kind, repo_opts),
+
+        pub fn init(allocator: std.mem.Allocator, repo: *rp.Repo(repo_kind, repo_opts)) !Diff(Widget, repo_kind, repo_opts) {
+            var inner_box = try wgt.Box(Widget).init(allocator, .{ .border = null, .direction = .vert });
+            errdefer inner_box.deinit(allocator);
+
+            var scroll = try wgt.Scroll(Widget).init(allocator, .{ .box = inner_box }, .{ .direction = .both });
+            errdefer scroll.deinit(allocator);
+
+            var outer_box = try wgt.Box(Widget).init(allocator, .{ .border = .single, .direction = .vert });
+            errdefer outer_box.deinit(allocator);
+            try outer_box.children.put(allocator, scroll.getFocus().id, .{ .widget = .{ .scroll = scroll }, .rect = null, .min_size = null });
+
+            return .{
+                .box = outer_box,
+                .repo = repo,
+                .iter_arena = std.heap.ArenaAllocator.init(allocator),
+                .file_iter = null,
+                .hunk_iter = null,
+            };
+        }
+
+        pub fn deinit(self: *Diff(Widget, repo_kind, repo_opts), allocator: std.mem.Allocator) void {
+            self.iter_arena.deinit();
+            self.box.deinit(allocator);
+        }
+
+        pub fn build(self: *Diff(Widget, repo_kind, repo_opts), allocator: std.mem.Allocator, constraint: layout.Constraint, root_focus: *Focus) !void {
+            self.clearGrid();
+            self.box.options.border = if (root_focus.grandchild_id == self.getFocus().id) .double else .single;
+            try self.box.build(allocator, constraint, root_focus);
+
+            // add another diff if necessary
+            if (self.box.children.values()[0].widget.scroll.viewport) |viewport| {
+                const scroll_y = self.box.children.values()[0].widget.scroll.y;
+                const u_scroll_y: usize = if (scroll_y >= 0) @intCast(scroll_y) else 0;
+                if (self.box.children.values()[0].widget.scroll.content_size) |content| {
+                    const min_scroll_remaining = 5;
+                    if (content.height -| (viewport.height + u_scroll_y) <= min_scroll_remaining) {
+                        // get the next file
+                        if (self.hunk_iter == null) {
+                            if (self.file_iter) |*file_iter| {
+                                if (try file_iter.next()) |line_iter_pair| {
+                                    const line_iter_a = try self.iter_arena.allocator().create(df.LineIterator(repo_kind, repo_opts));
+                                    line_iter_a.* = line_iter_pair.a;
+
+                                    const line_iter_b = try self.iter_arena.allocator().create(df.LineIterator(repo_kind, repo_opts));
+                                    line_iter_b.* = line_iter_pair.b;
+
+                                    self.hunk_iter = try df.HunkIterator(repo_kind, repo_opts).init(self.iter_arena.allocator(), line_iter_a, line_iter_b);
+                                } else {
+                                    self.file_iter = null;
+                                }
+                            }
+                        }
+
+                        // add the next hunk
+                        if (self.hunk_iter) |*hunk_iter| {
+                            if (hunk_iter.header_lines.items.len > 0) {
+                                try self.addLines(allocator, hunk_iter.header_lines.items);
+                                hunk_iter.header_lines.clearAndFree(hunk_iter.arena.allocator());
+                            }
+                            if (try hunk_iter.next(self.iter_arena.allocator())) |*hunk_ptr| {
+                                try self.addHunk(allocator, hunk_iter, hunk_ptr);
+                            } else {
+                                self.hunk_iter = null;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        pub fn input(self: *Diff(Widget, repo_kind, repo_opts), allocator: std.mem.Allocator, key: Key, root_focus: *Focus) !void {
+            _ = allocator;
+            _ = root_focus;
+            switch (key) {
+                .arrow_up => {
+                    if (self.box.children.values()[0].widget.scroll.y > 0) {
+                        self.box.children.values()[0].widget.scroll.y -= 1;
+                    }
+                },
+                .arrow_down => {
+                    if (self.box.children.values()[0].widget.scroll.viewport) |viewport| {
+                        const scroll_y = self.box.children.values()[0].widget.scroll.y;
+                        const u_scroll_y: usize = if (scroll_y >= 0) @intCast(scroll_y) else 0;
+                        if (self.box.children.values()[0].widget.scroll.content_size) |content| {
+                            if (viewport.height + u_scroll_y < content.height) {
+                                self.box.children.values()[0].widget.scroll.y += 1;
+                            }
+                        }
+                    }
+                },
+                .arrow_left => {
+                    if (self.box.children.values()[0].widget.scroll.x > 0) {
+                        self.box.children.values()[0].widget.scroll.x -= 1;
+                    }
+                },
+                .arrow_right => {
+                    if (self.box.children.values()[0].widget.scroll.viewport) |viewport| {
+                        const scroll_x = self.box.children.values()[0].widget.scroll.x;
+                        const u_scroll_x: usize = if (scroll_x >= 0) @intCast(scroll_x) else 0;
+                        if (self.box.children.values()[0].widget.scroll.content_size) |content| {
+                            if (viewport.width + u_scroll_x < content.width) {
+                                self.box.children.values()[0].widget.scroll.x += 1;
+                            }
+                        }
+                    }
+                },
+                .home => {
+                    self.box.children.values()[0].widget.scroll.y = 0;
+                },
+                .end => {
+                    if (self.box.children.values()[0].widget.scroll.viewport) |viewport| {
+                        if (self.box.children.values()[0].widget.scroll.content_size) |content| {
+                            const max_scroll: isize = if (content.height > viewport.height) @intCast(content.height - viewport.height) else 0;
+                            self.box.children.values()[0].widget.scroll.y = max_scroll;
+                        }
+                    }
+                },
+                .page_up => {
+                    if (self.box.children.values()[0].widget.scroll.viewport) |viewport| {
+                        const scroll_y = self.box.children.values()[0].widget.scroll.y;
+                        const scroll_change: isize = @intCast(viewport.height / 2);
+                        self.box.children.values()[0].widget.scroll.y = @max(0, scroll_y - scroll_change);
+                    }
+                },
+                .page_down => {
+                    if (self.box.children.values()[0].widget.scroll.viewport) |viewport| {
+                        if (self.box.children.values()[0].widget.scroll.content_size) |content| {
+                            const max_scroll: isize = if (content.height > viewport.height) @intCast(content.height - viewport.height) else 0;
+                            const scroll_y = self.box.children.values()[0].widget.scroll.y;
+                            const scroll_change: isize = @intCast(viewport.height / 2);
+                            self.box.children.values()[0].widget.scroll.y = @min(scroll_y + scroll_change, max_scroll);
+                        }
+                    }
+                },
+                .scroll_up => {
+                    if (self.box.children.values()[0].widget.scroll.y > 0) {
+                        self.box.children.values()[0].widget.scroll.y -= 1;
+                    }
+                },
+                .scroll_down => {
+                    if (self.box.children.values()[0].widget.scroll.viewport) |viewport| {
+                        const scroll_y = self.box.children.values()[0].widget.scroll.y;
+                        const u_scroll_y: usize = if (scroll_y >= 0) @intCast(scroll_y) else 0;
+                        if (self.box.children.values()[0].widget.scroll.content_size) |content| {
+                            if (viewport.height + u_scroll_y < content.height) {
+                                self.box.children.values()[0].widget.scroll.y += 1;
+                            }
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+
+        pub fn clearGrid(self: *Diff(Widget, repo_kind, repo_opts)) void {
+            self.box.clearGrid();
+        }
+
+        pub fn getGrid(self: Diff(Widget, repo_kind, repo_opts)) ?Grid {
+            return self.box.getGrid();
+        }
+
+        pub fn getFocus(self: *Diff(Widget, repo_kind, repo_opts)) *Focus {
+            return self.box.getFocus();
+        }
+
+        pub fn clearDiffs(self: *Diff(Widget, repo_kind, repo_opts), allocator: std.mem.Allocator) !void {
+            // reset the arena
+            self.file_iter = null;
+            self.hunk_iter = null;
+            _ = self.iter_arena.reset(.free_all);
+
+            // remove old diff widgets
+            for (self.box.children.values()[0].widget.scroll.child.box.children.values()) |*child| {
+                child.widget.deinit(allocator);
+            }
+            self.box.children.values()[0].widget.scroll.child.box.children.clearAndFree(allocator);
+
+            // reset scroll position
+            const widget = &self.box.children.values()[0].widget;
+            widget.scroll.x = 0;
+            widget.scroll.y = 0;
+        }
+
+        pub fn addLines(self: *Diff(Widget, repo_kind, repo_opts), allocator: std.mem.Allocator, lines: []const []const u8) !void {
+            const buf = blk: {
+                var writer = std.Io.Writer.Allocating.init(allocator);
+                errdefer writer.deinit();
+
+                // add header
+                for (lines) |line| {
+                    try writer.writer.print("{s}\n", .{line});
+                }
+
+                break :blk try writer.toOwnedSlice();
+            };
+            defer allocator.free(buf);
+
+            // add new diff widget with bold header lines
+            var text_box = try wgt.TextBox.init(allocator, buf, .{ .border = .hidden, .wrap_kind = .none, .style = .{ .bold = true } });
+            errdefer text_box.deinit(allocator);
+            try self.box.children.values()[0].widget.scroll.child.box.children.put(allocator, text_box.getFocus().id, .{ .widget = .{ .text_box = text_box }, .rect = null, .min_size = null });
+        }
+
+        pub fn addHunk(
+            self: *Diff(Widget, repo_kind, repo_opts),
+            allocator: std.mem.Allocator,
+            hunk_iter: *const df.HunkIterator(repo_kind, repo_opts),
+            hunk: *const df.Hunk(repo_kind, repo_opts),
+        ) !void {
+            const buf = blk: {
+                var writer = std.Io.Writer.Allocating.init(allocator);
+                errdefer writer.deinit();
+
+                try hunk_iter.writeHunk(hunk, &writer.writer, false);
+
+                break :blk try writer.toOwnedSlice();
+            };
+            defer allocator.free(buf);
+
+            // add new diff widget
+            var text_box = try diffTextBox(allocator, buf);
+            errdefer text_box.deinit(allocator);
+            try self.box.children.values()[0].widget.scroll.child.box.children.put(allocator, text_box.getFocus().id, .{ .widget = .{ .text_box = text_box }, .rect = null, .min_size = null });
+        }
+
+        pub fn getScrollX(self: Diff(Widget, repo_kind, repo_opts)) isize {
+            return self.box.children.values()[0].widget.scroll.x;
+        }
+
+        pub fn getScrollY(self: Diff(Widget, repo_kind, repo_opts)) isize {
+            return self.box.children.values()[0].widget.scroll.y;
+        }
+
+        pub fn isEmpty(self: Diff(Widget, repo_kind, repo_opts)) bool {
+            return self.box.children.values()[0].widget.scroll.child.box.children.count() == 0;
+        }
+    };
+}
+
+// a borderless text box for diff text, with added lines green and removed
+// lines red. the text box copies the text, so the spans only live until init.
+fn diffTextBox(allocator: std.mem.Allocator, text: []const u8) !wgt.TextBox {
+    var spans: std.ArrayList(wgt.Span) = .empty;
+    defer spans.deinit(allocator);
+    var start: usize = 0;
+    while (start < text.len) {
+        // each span keeps its trailing newline so the text box still breaks there
+        const end = if (std.mem.findScalarPos(u8, text, start, '\n')) |nl| nl + 1 else text.len;
+        const line = text[start..end];
+        const style: wgt.Style = if (std.mem.startsWith(u8, line, "+"))
+            .{ .fg = .ansi(.green) }
+        else if (std.mem.startsWith(u8, line, "-"))
+            .{ .fg = .ansi(.red) }
+        else
+            .{};
+        try spans.append(allocator, .{ .text = line, .style = style });
+        start = end;
+    }
+    return try wgt.TextBox.initSpans(allocator, spans.items, .{ .border = .hidden, .wrap_kind = .none });
+}

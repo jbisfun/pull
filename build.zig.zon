@@ -1,0 +1,23 @@
+.{
+    .name = .pull,
+    .version = "0.1.0",
+    .fingerprint = 0x950ddce30ea66efb,
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .clap = .{
+            .url = "git+https://github.com/Hejsil/zig-clap#05faf3905e8548f5cc269a8836e154065e70128d",
+            .hash = "clap-0.12.0-oBajB4XpAQCF1WRKnD5KOKPsnwwT_NNdAJ7Ww3irYJac",
+        },
+        .core = .{ .path = "pkgs/core" },
+        .git = .{ .path = "pkgs/git" },
+        .env = .{ .path = "pkgs/env" },
+        .hooks = .{ .path = "pkgs/hooks" },
+        .lint = .{ .path = "pkgs/lint" },
+        .ignore = .{ .path = "pkgs/ignore" },
+        .worktree = .{ .path = "pkgs/worktree" },
+        .tool = .{ .path = "pkgs/tool" },
+        .launchd = .{ .path = "pkgs/launchd" },
+        .mcp = .{ .path = "pkgs/mcp" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "pkgs" },
+}

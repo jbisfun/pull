@@ -1,0 +1,1539 @@
+const std = @import("std");
+const builtin = @import("builtin");
+const hash = @import("./hash.zig");
+const idx = @import("./index.zig");
+const rf = @import("./ref.zig");
+const fs = @import("./fs.zig");
+const rp = @import("./repo.zig");
+const pack = @import("./pack.zig");
+const chunk = @import("./chunk.zig");
+const cfg = @import("./config.zig");
+const tg = @import("./tag.zig");
+const tr = @import("./tree.zig");
+const mrg = @import("./merge.zig");
+
+fn compressZlib(comptime buffer_size: usize, io: std.Io, in: std.Io.File, out: std.Io.File) !void {
+    var rbuf: [buffer_size]u8 = @splat(0);
+    var wbuf: [buffer_size]u8 = @splat(0);
+    var dbuf: [std.compress.flate.max_window_len]u8 = @splat(0);
+    var r = in.reader(io, &rbuf);
+    var w = out.writer(io, &wbuf);
+    var d = try std.compress.flate.Compress.init(&w.interface, &dbuf, .zlib, .default);
+    _ = try r.interface.streamRemaining(&d.writer);
+    try d.finish();
+    try w.interface.flush();
+}
+
+pub fn writeObject(
+    comptime repo_kind: rp.RepoKind,
+    comptime repo_opts: rp.RepoOpts(repo_kind),
+    state: rp.Repo(repo_kind, repo_opts).State(.read_write),
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    reader: *std.Io.Reader,
+    header: ObjectHeader,
+    hash_bytes_buffer: *[hash.byteLen(repo_opts.hash)]u8,
+) !void {
+    // serialize object header
+    var header_bytes: [32]u8 = @splat(0);
+    const header_str = try header.write(&header_bytes);
+
+    var hasher = hash.Hasher(repo_opts.hash).init(.{});
+    hasher.update(header_str);
+
+    var hash_buffer: [repo_opts.buffer_size]u8 = @splat(0);
+    var hashed = reader.hashed(hasher, &hash_buffer);
+
+    switch (repo_kind) {
+        .git => {
+            var temp_lock = try fs.LockFile.init(io, state.core.repo_dir, "object.temp");
+            defer temp_lock.deinit(io);
+            try temp_lock.lock_file.writeStreamingAll(io, header_str);
+
+            // copy file into temp file
+            var read_buffer: [repo_opts.read_size]u8 = @splat(0);
+            while (true) {
+                const size = try hashed.reader.readSliceShort(&read_buffer);
+                if (size == 0) {
+                    break;
+                }
+                try temp_lock.lock_file.writeStreamingAll(io, read_buffer[0..size]);
+            }
+
+            hashed.hasher.final(hash_bytes_buffer);
+
+            const hash_hex = std.fmt.bytesToHex(hash_bytes_buffer, .lower);
+
+            var objects_dir = try state.core.repo_dir.openDir(io, "objects", .{});
+            defer objects_dir.close(io);
+
+            // make the two char dir
+            var hash_prefix_dir = try objects_dir.createDirPathOpen(io, hash_hex[0..2], .{});
+            defer hash_prefix_dir.close(io);
+            const hash_suffix = hash_hex[2..];
+
+            // exit early if the file already exists
+            if (hash_prefix_dir.openFile(io, hash_suffix, .{ .allow_directory = false })) |hash_suffix_file| {
+                hash_suffix_file.close(io);
+                return;
+            } else |err| switch (err) {
+                error.FileNotFound => {},
+                else => |e| return e,
+            }
+
+            // create compressed lock file
+            var compressed_lock = try fs.LockFile.init(io, hash_prefix_dir, hash_suffix);
+            defer compressed_lock.deinit(io);
+            try compressZlib(repo_opts.buffer_size, io, temp_lock.lock_file, compressed_lock.lock_file);
+            compressed_lock.success = true;
+        },
+        .xit => {
+            try chunk.writeChunks(repo_opts, state, allocator, &hashed, header.size, header.kind.name(), hash_bytes_buffer);
+        },
+    }
+}
+
+pub const Tree = struct {
+    entries: std.array_hash_map.String([]const u8),
+    arena: *std.heap.ArenaAllocator,
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) !Tree {
+        const arena = try allocator.create(std.heap.ArenaAllocator);
+        errdefer allocator.destroy(arena);
+        arena.* = std.heap.ArenaAllocator.init(allocator);
+        return .{
+            .entries = .empty,
+            .arena = arena,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Tree) void {
+        self.arena.deinit();
+        self.allocator.destroy(self.arena);
+    }
+
+    pub fn initFromIndex(
+        comptime repo_kind: rp.RepoKind,
+        comptime repo_opts: rp.RepoOpts(repo_kind),
+        state: rp.Repo(repo_kind, repo_opts).State(.read_write),
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        index: *const idx.Index(repo_kind, repo_opts),
+    ) !Tree {
+        var tree = try Tree.init(allocator);
+        errdefer tree.deinit();
+        try tree.addIndexEntries(repo_kind, repo_opts, state, io, allocator, index, "");
+        return tree;
+    }
+
+    pub fn addBlobEntry(self: *Tree, mode: fs.Mode, name: []const u8, oid: []const u8) !void {
+        const entry = try self.arena.allocator().print("{s} {s}\x00{s}", .{ mode.toStr(), name, oid });
+        try self.entries.put(self.arena.allocator(), try self.arena.allocator().dupe(u8, name), entry);
+    }
+
+    pub fn addTreeEntry(self: *Tree, name: []const u8, oid: []const u8) !void {
+        const entry = try self.arena.allocator().print("40000 {s}\x00{s}", .{ name, oid });
+        // git sorts tree names as if they had a trailing slash
+        const sort_name = try self.arena.allocator().print("{s}/", .{name});
+        try self.entries.put(self.arena.allocator(), sort_name, entry);
+    }
+
+    fn addIndexEntries(
+        self: *Tree,
+        comptime repo_kind: rp.RepoKind,
+        comptime repo_opts: rp.RepoOpts(repo_kind),
+        state: rp.Repo(repo_kind, repo_opts).State(.read_write),
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        index: *const idx.Index(repo_kind, repo_opts),
+        prefix: []const u8,
+    ) !void {
+        const children = index.children.get(prefix) orelse return;
+        for (children.keys()) |name| {
+            const path = try fs.joinPath(allocator, &.{ prefix, name });
+            defer allocator.free(path);
+
+            if (index.entries.get(path)) |*entries_for_path| {
+                const entry = entries_for_path[0] orelse return error.NullEntry;
+                try self.addBlobEntry(entry.mode, name, &entry.oid);
+            } else if (index.children.contains(path)) {
+                var subtree = try Tree.init(allocator);
+                defer subtree.deinit();
+
+                try subtree.addIndexEntries(
+                    repo_kind,
+                    repo_opts,
+                    state,
+                    io,
+                    allocator,
+                    index,
+                    path,
+                );
+
+                var tree_hash_bytes_buffer: [hash.byteLen(repo_opts.hash)]u8 = @splat(0);
+                try writeTree(repo_kind, repo_opts, state, io, allocator, &subtree, &tree_hash_bytes_buffer);
+
+                try self.addTreeEntry(name, &tree_hash_bytes_buffer);
+            } else {
+                return error.ObjectEntryNotFound;
+            }
+        }
+    }
+};
+
+// pull patch: pub, so pull can write the index tree and build its own (GPG-signed) commit.
+pub fn writeTree(
+    comptime repo_kind: rp.RepoKind,
+    comptime repo_opts: rp.RepoOpts(repo_kind),
+    state: rp.Repo(repo_kind, repo_opts).State(.read_write),
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    tree: *Tree,
+    hash_bytes_buffer: *[hash.byteLen(repo_opts.hash)]u8,
+) !void {
+    // sort the entries so the tree hashes the same way it would from git
+    const SortCtx = struct {
+        keys: [][]const u8,
+        pub fn lessThan(ctx: @This(), a_index: usize, b_index: usize) bool {
+            return std.mem.lessThan(u8, ctx.keys[a_index], ctx.keys[b_index]);
+        }
+    };
+    tree.entries.sort(SortCtx{ .keys = tree.entries.keys() });
+
+    // create tree contents
+    const tree_contents = try std.mem.join(allocator, "", tree.entries.values());
+    defer allocator.free(tree_contents);
+
+    var reader = std.Io.Reader.fixed(tree_contents);
+    try writeObject(repo_kind, repo_opts, state, io, allocator, &reader, .{ .kind = .tree, .size = tree_contents.len }, hash_bytes_buffer);
+}
+
+/// returns the key to sign with, or null if signing isn't turned on for
+/// the given section. only ssh signing is supported.
+fn signingKey(
+    comptime repo_kind: rp.RepoKind,
+    comptime repo_opts: rp.RepoOpts(repo_kind),
+    config: *const cfg.Config(repo_kind, repo_opts),
+    section_name: []const u8,
+) !?[]const u8 {
+    const section = config.sections.get(section_name) orelse return null;
+    const gpgsign = section.get("gpgsign") orelse return null;
+    if (!cfg.parseBool(gpgsign)) return null;
+
+    const format = if (config.sections.get("gpg")) |gpg_section|
+        gpg_section.get("format") orelse "openpgp"
+    else
+        "openpgp";
+    if (!std.mem.eql(u8, format, "ssh")) return error.UnsupportedSigningFormat;
+
+    const user_section = config.sections.get("user") orelse return error.SigningKeyNotFound;
+    return user_section.get("signingkey") orelse error.SigningKeyNotFound;
+}
+
+fn sign(
+    comptime repo_kind: rp.RepoKind,
+    comptime repo_opts: rp.RepoOpts(repo_kind),
+    state: rp.Repo(repo_kind, repo_opts).State(.read_only),
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    arena: *std.heap.ArenaAllocator,
+    lines: []const []const u8,
+    signing_key: []const u8,
+) ![]const []const u8 {
+    const content = try std.mem.join(arena.allocator(), "\n", lines);
+
+    // get the content file path
+    const repo_dir_name = switch (repo_kind) {
+        .git => ".git",
+        .xit => ".xit",
+    };
+    const content_file_name = "xit_signing_buffer";
+    const content_file_path = try std.Io.Dir.path.join(allocator, &.{ state.core.work_path, repo_dir_name, content_file_name });
+    defer allocator.free(content_file_path);
+
+    // write the commit content to a file
+    const content_file = try std.Io.Dir.createFileAbsolute(io, content_file_path, .{ .truncate = true, .lock = .exclusive });
+    defer {
+        content_file.close(io);
+        std.Io.Dir.deleteFileAbsolute(io, content_file_path) catch {};
+    }
+    try content_file.writeStreamingAll(io, content);
+
+    // sign the file. the child gets no stdio, so it can never block on a
+    // passphrase prompt or write to a terminal xit doesn't own.
+    var process = try std.process.spawn(io, .{
+        .argv = &.{ "ssh-keygen", "-Y", "sign", "-n", "git", "-f", signing_key, content_file_path },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    const term = try process.wait(io);
+    if (0 != term.exited) {
+        return error.ObjectSigningFailed;
+    }
+
+    // read the sig
+    {
+        const sig_file_name = content_file_name ++ ".sig";
+        const sig_file = try state.core.repo_dir.openFile(io, sig_file_name, .{ .mode = .read_only });
+        defer {
+            sig_file.close(io);
+            state.core.repo_dir.deleteFile(io, sig_file_name) catch {};
+        }
+
+        var reader_buffer: [repo_opts.buffer_size]u8 = @splat(0);
+        var sig_file_reader = sig_file.reader(io, &reader_buffer);
+        var sig_lines: std.ArrayList([]const u8) = .empty;
+
+        // for each line...
+        while (sig_file_reader.interface.peekByte()) |_| {
+            var line_writer = std.Io.Writer.Allocating.init(arena.allocator());
+            _ = try sig_file_reader.interface.streamDelimiterLimit(&line_writer.writer, '\n', .limited(repo_opts.max_read_size));
+
+            // skip delimiter
+            if (sig_file_reader.interface.bufferedLen() > 0) {
+                sig_file_reader.interface.toss(1);
+            }
+
+            try sig_lines.append(arena.allocator(), line_writer.written());
+        } else |err| switch (err) {
+            error.EndOfStream => {},
+            else => |e| return e,
+        }
+
+        return try sig_lines.toOwnedSlice(arena.allocator());
+    }
+}
+
+pub fn CommitMetadata(comptime hash_kind: hash.HashKind) type {
+    return struct {
+        author: ?[]const u8 = null,
+        committer: ?[]const u8 = null,
+        message: []const u8 = "",
+        parent_oids: ?[]const [hash.hexLen(hash_kind)]u8 = null,
+        allow_empty: bool = false,
+        timestamp: u64 = 0,
+
+        pub fn firstParent(self: CommitMetadata(hash_kind)) ?*const [hash.hexLen(hash_kind)]u8 {
+            if (self.parent_oids) |parent_oids| {
+                if (parent_oids.len > 0) {
+                    return &parent_oids[0];
+                }
+            }
+            return null;
+        }
+    };
+}
+
+// write an unsigned commit around an existing tree without updating a ref
+pub fn writeCommitWithoutRef(
+    comptime repo_kind: rp.RepoKind,
+    comptime repo_opts: rp.RepoOpts(repo_kind),
+    state: rp.Repo(repo_kind, repo_opts).State(.read_write),
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    metadata: CommitMetadata(repo_opts.hash),
+    tree_oid: *const [hash.hexLen(repo_opts.hash)]u8,
+) ![hash.hexLen(repo_opts.hash)]u8 {
+    var tree_reader = try ObjectReader(repo_kind, repo_opts).init(state.readOnly(), io, allocator, tree_oid);
+    defer tree_reader.deinit();
+    if (tree_reader.header().kind != .tree) return error.InvalidTreeObject;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var metadata_lines: std.ArrayList([]const u8) = .empty;
+    try metadata_lines.append(arena.allocator(), try arena.allocator().print("tree {s}", .{tree_oid}));
+    for (metadata.parent_oids orelse &.{}) |parent_oid| {
+        try metadata_lines.append(arena.allocator(), try arena.allocator().print("parent {s}", .{parent_oid}));
+    }
+
+    const author = metadata.author orelse return error.AuthorNotFound;
+    const timestamp: i64 = @intCast(metadata.timestamp);
+    for ([_][]const u8{ "author", "committer" }, [_][]const u8{ author, metadata.committer orelse author }) |kind, identity| {
+        try metadata_lines.append(arena.allocator(), try formatCommitIdentity(arena.allocator(), kind, identity, timestamp));
+    }
+    try metadata_lines.append(arena.allocator(), try arena.allocator().print("\n{s}", .{metadata.message}));
+
+    const commit_contents = try std.mem.join(allocator, "\n", metadata_lines.items);
+    defer allocator.free(commit_contents);
+
+    var oid_bytes: [hash.byteLen(repo_opts.hash)]u8 = @splat(0);
+    var reader = std.Io.Reader.fixed(commit_contents);
+    try writeObject(repo_kind, repo_opts, state, io, allocator, &reader, .{ .kind = .commit, .size = commit_contents.len }, &oid_bytes);
+    return std.fmt.bytesToHex(oid_bytes, .lower);
+}
+
+pub fn writeCommitAtHead(
+    comptime repo_kind: rp.RepoKind,
+    comptime repo_opts: rp.RepoOpts(repo_kind),
+    state: rp.Repo(repo_kind, repo_opts).State(.read_write),
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    metadata: CommitMetadata(repo_opts.hash),
+) ![hash.hexLen(repo_opts.hash)]u8 {
+    // make sure there is no unfinished merge in progress
+    try mrg.checkForUnfinishedMerge(repo_kind, repo_opts, state.readOnly(), io);
+
+    // read index
+    var index = try idx.Index(repo_kind, repo_opts).init(state.readOnly(), io, allocator);
+    defer index.deinit();
+
+    // create tree and add index entries
+    var tree = try Tree.initFromIndex(repo_kind, repo_opts, state, io, allocator, &index);
+    defer tree.deinit();
+
+    return try writeCommit(repo_kind, repo_opts, state, io, allocator, metadata, &tree, .{ .kind = .none, .name = "HEAD" });
+}
+
+pub fn writeCommit(
+    comptime repo_kind: rp.RepoKind,
+    comptime repo_opts: rp.RepoOpts(repo_kind),
+    state: rp.Repo(repo_kind, repo_opts).State(.read_write),
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    metadata: CommitMetadata(repo_opts.hash),
+    tree_maybe: ?*Tree,
+    ref: rf.Ref,
+) ![hash.hexLen(repo_opts.hash)]u8 {
+    const parent_oids = if (metadata.parent_oids) |oids|
+        oids
+    else if (try rf.readRecur(repo_kind, repo_opts, state.readOnly(), io, .{ .ref = ref })) |oid|
+        &.{oid}
+    else
+        &.{};
+
+    const tree_hash_hex = if (tree_maybe) |tree| blk: {
+        // hash the tree
+        var tree_hash_bytes_buffer: [hash.byteLen(repo_opts.hash)]u8 = @splat(0);
+        try writeTree(repo_kind, repo_opts, state, io, allocator, tree, &tree_hash_bytes_buffer);
+        const hash_hex = std.fmt.bytesToHex(tree_hash_bytes_buffer, .lower);
+
+        if (!metadata.allow_empty) {
+            // don't allow commit if the tree hasn't changed
+            if (parent_oids.len == 0) {
+                if (tree.entries.count() == 0) {
+                    return error.EmptyCommit;
+                }
+            } else if (parent_oids.len == 1) {
+                var first_parent = try Object(repo_kind, repo_opts).init(state.readOnly(), io, allocator, &parent_oids[0]);
+                defer first_parent.deinit();
+                if (std.mem.eql(u8, &first_parent.content.commit.tree, &hash_hex)) {
+                    return error.EmptyCommit;
+                }
+            }
+        }
+
+        break :blk hash_hex;
+    } else if (parent_oids.len == 0) blk: {
+        // hash an empty tree
+        var tree = try Tree.init(allocator);
+        defer tree.deinit();
+        var tree_hash_bytes_buffer: [hash.byteLen(repo_opts.hash)]u8 = @splat(0);
+        try writeTree(repo_kind, repo_opts, state, io, allocator, &tree, &tree_hash_bytes_buffer);
+        break :blk std.fmt.bytesToHex(tree_hash_bytes_buffer, .lower);
+    } else blk: {
+        // use the first parent's tree hash
+        var first_parent = try Object(repo_kind, repo_opts).init(state.readOnly(), io, allocator, &parent_oids[0]);
+        defer first_parent.deinit();
+        break :blk first_parent.content.commit.tree;
+    };
+
+    // create commit contents
+    const commit_contents = blk: {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+
+        var config = try cfg.Config(repo_kind, repo_opts).init(state.readOnly(), io, arena.allocator());
+        defer config.deinit();
+
+        var metadata_lines: std.ArrayList([]const u8) = .empty;
+
+        try metadata_lines.append(arena.allocator(), try arena.allocator().print("tree {s}", .{tree_hash_hex}));
+        for (parent_oids) |parent_oid| {
+            try metadata_lines.append(arena.allocator(), try arena.allocator().print("parent {s}", .{parent_oid}));
+        }
+
+        const ts: i64 = if (metadata.timestamp != 0)
+            @intCast(metadata.timestamp)
+        else if (repo_opts.is_test) 0 else std.Io.Timestamp.now(io, .real).toSeconds();
+
+        const author = metadata.author orelse try userIdentity(repo_kind, repo_opts, &config, arena.allocator());
+        for ([_][]const u8{ "author", "committer" }, [_][]const u8{ author, metadata.committer orelse author }) |kind, identity| {
+            try metadata_lines.append(arena.allocator(), try formatCommitIdentity(arena.allocator(), kind, identity, ts));
+        }
+
+        try metadata_lines.append(arena.allocator(), try arena.allocator().print("\n{s}", .{metadata.message}));
+
+        // sign if the config asks for it
+        if (try signingKey(repo_kind, repo_opts, &config, "commit")) |signing_key| {
+            const sig_lines = try sign(repo_kind, repo_opts, state.readOnly(), io, allocator, &arena, metadata_lines.items, signing_key);
+            const sig_header = switch (repo_opts.hash) {
+                .sha1 => "gpgsig",
+                .sha256 => "gpgsig-sha256",
+            };
+
+            const message = metadata_lines.pop() orelse unreachable; // remove the message
+            for (sig_lines, 0..) |line, i| {
+                const sig_line = if (i == 0)
+                    try arena.allocator().print("{s} {s}", .{ sig_header, line })
+                else
+                    try arena.allocator().print(" {s}", .{line});
+                try metadata_lines.append(arena.allocator(), sig_line);
+            }
+
+            try metadata_lines.append(arena.allocator(), message); // add the message back
+        }
+
+        break :blk try std.mem.join(allocator, "\n", metadata_lines.items);
+    };
+    defer allocator.free(commit_contents);
+
+    var commit_hash_bytes_buffer: [hash.byteLen(repo_opts.hash)]u8 = @splat(0);
+    var reader = std.Io.Reader.fixed(commit_contents);
+    try writeObject(repo_kind, repo_opts, state, io, allocator, &reader, .{ .kind = .commit, .size = commit_contents.len }, &commit_hash_bytes_buffer);
+
+    const commit_hash_hex = std.fmt.bytesToHex(commit_hash_bytes_buffer, .lower);
+
+    // write commit id to ref
+    var ref_path_buffer: [rf.MAX_REF_CONTENT_SIZE]u8 = @splat(0);
+    const ref_path = try ref.toPath(&ref_path_buffer);
+    try rf.writeRecur(repo_kind, repo_opts, state, io, ref_path, &commit_hash_hex);
+
+    return commit_hash_hex;
+}
+
+fn formatCommitIdentity(allocator: std.mem.Allocator, kind: []const u8, value: []const u8, timestamp: i64) ![]u8 {
+    const identity = std.mem.trimEnd(u8, value, " \t");
+    if (identity.len == 0 or std.mem.findAny(u8, identity, "\r\n") != null) return error.InvalidCommitIdentity;
+    if (std.mem.findScalarLast(u8, identity, '>')) |end| {
+        var date = std.mem.tokenizeAny(u8, identity[end + 1 ..], " \t");
+        if (date.next()) |seconds| {
+            _ = std.fmt.parseInt(u64, seconds, 10) catch return error.InvalidCommitIdentity;
+            const zone = date.next() orelse return error.InvalidCommitIdentity;
+            if (date.next() != null or zone.len != 5 or (zone[0] != '+' and zone[0] != '-')) return error.InvalidCommitIdentity;
+            for (zone[1..]) |digit| if (!std.ascii.isDigit(digit)) return error.InvalidCommitIdentity;
+            return allocator.print("{s} {s} {s} {s}", .{ kind, identity[0 .. end + 1], seconds, zone });
+        }
+    }
+    return allocator.print("{s} {s} {} +0000", .{ kind, identity, timestamp });
+}
+
+pub fn userIdentity(
+    comptime repo_kind: rp.RepoKind,
+    comptime repo_opts: rp.RepoOpts(repo_kind),
+    config: *const cfg.Config(repo_kind, repo_opts),
+    allocator: std.mem.Allocator,
+) ![]const u8 {
+    if (repo_opts.is_test) return "radar <radar@roark>";
+    const user_section = config.sections.get("user") orelse return error.UserConfigNotFound;
+    const name = user_section.get("name") orelse return error.UserConfigNotFound;
+    const email = user_section.get("email") orelse return error.UserConfigNotFound;
+    return try allocator.print("{s} <{s}>", .{ name, email });
+}
+
+pub fn writeTag(
+    comptime repo_kind: rp.RepoKind,
+    comptime repo_opts: rp.RepoOpts(repo_kind),
+    state: rp.Repo(repo_kind, repo_opts).State(.read_write),
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    input: tg.AddTagInput,
+    target_oid: *const [hash.hexLen(repo_opts.hash)]u8,
+) ![hash.hexLen(repo_opts.hash)]u8 {
+    const tag_contents = blk: {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+
+        var config = try cfg.Config(repo_kind, repo_opts).init(state.readOnly(), io, arena.allocator());
+        defer config.deinit();
+
+        var metadata_lines: std.ArrayList([]const u8) = .empty;
+
+        const kind = kind_blk: {
+            var obj_rdr = try ObjectReader(repo_kind, repo_opts).init(state.readOnly(), io, allocator, target_oid);
+            defer obj_rdr.deinit();
+            break :kind_blk obj_rdr.header().kind;
+        };
+
+        try metadata_lines.append(arena.allocator(), try arena.allocator().print("object {s}", .{target_oid}));
+        try metadata_lines.append(arena.allocator(), try arena.allocator().print("type {s}", .{kind.name()}));
+        try metadata_lines.append(arena.allocator(), try arena.allocator().print("tag {s}", .{input.name}));
+
+        const ts = if (repo_opts.is_test) 0 else std.Io.Timestamp.now(io, .real).toSeconds();
+
+        const tagger = input.tagger orelse try userIdentity(repo_kind, repo_opts, &config, arena.allocator());
+        try metadata_lines.append(arena.allocator(), try arena.allocator().print("tagger {s} {} +0000", .{ tagger, ts }));
+
+        try metadata_lines.append(arena.allocator(), try arena.allocator().print("\n{s}", .{input.message orelse ""}));
+
+        // sign if the config asks for it
+        if (try signingKey(repo_kind, repo_opts, &config, "tag")) |signing_key| {
+            // include the newline that separates the content from the signature
+            try metadata_lines.append(arena.allocator(), "");
+            const sig_lines = try sign(repo_kind, repo_opts, state.readOnly(), io, allocator, &arena, metadata_lines.items, signing_key);
+            _ = metadata_lines.pop();
+            try metadata_lines.appendSlice(arena.allocator(), sig_lines);
+        }
+
+        break :blk try std.mem.join(allocator, "\n", metadata_lines.items);
+    };
+    defer allocator.free(tag_contents);
+
+    var tag_hash_bytes_buffer: [hash.byteLen(repo_opts.hash)]u8 = @splat(0);
+    var reader = std.Io.Reader.fixed(tag_contents);
+    try writeObject(repo_kind, repo_opts, state, io, allocator, &reader, .{ .kind = .tag, .size = tag_contents.len }, &tag_hash_bytes_buffer);
+
+    return std.fmt.bytesToHex(tag_hash_bytes_buffer, .lower);
+}
+
+pub const ObjectKind = enum {
+    blob,
+    tree,
+    commit,
+    tag,
+
+    pub fn init(kind_str: []const u8) !ObjectKind {
+        return std.meta.stringToEnum(ObjectKind, kind_str) orelse error.InvalidObjectKind;
+    }
+
+    pub fn name(self: ObjectKind) []const u8 {
+        return @tagName(self);
+    }
+};
+
+pub fn ObjectReader(comptime repo_kind: rp.RepoKind, comptime repo_opts: rp.RepoOpts(repo_kind)) type {
+    return struct {
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        reader: Reader,
+        interface: std.Io.Reader,
+
+        pub const Reader = switch (repo_kind) {
+            .git => pack.LooseOrPackObjectReader(repo_kind, repo_opts),
+            .xit => chunk.ChunkObjectReader(repo_opts),
+        };
+
+        pub fn init(
+            state: rp.Repo(repo_kind, repo_opts).State(.read_only),
+            io: std.Io,
+            allocator: std.mem.Allocator,
+            oid: *const [hash.hexLen(repo_opts.hash)]u8,
+        ) !ObjectReader(repo_kind, repo_opts) {
+            const buffer = try allocator.alloc(u8, repo_opts.read_size);
+            errdefer allocator.free(buffer);
+
+            return .{
+                .io = io,
+                .allocator = allocator,
+                .reader = switch (repo_kind) {
+                    .git => try pack.LooseOrPackObjectReader(repo_kind, repo_opts).init(state, io, allocator, oid),
+                    .xit => try chunk.ChunkObjectReader(repo_opts).init(state, io, allocator, oid),
+                },
+                .interface = .{
+                    .vtable = &.{ .stream = stream },
+                    .buffer = buffer,
+                    .seek = 0,
+                    .end = 0,
+                },
+            };
+        }
+
+        pub fn deinit(self: *ObjectReader(repo_kind, repo_opts)) void {
+            self.reader.deinit(self.io, self.allocator);
+            self.allocator.free(self.interface.buffer);
+        }
+
+        pub fn reset(self: *ObjectReader(repo_kind, repo_opts)) !void {
+            try self.reader.reset();
+            self.interface.seek = 0;
+            self.interface.end = 0;
+        }
+
+        pub fn seekTo(self: *ObjectReader(repo_kind, repo_opts), position: u64) !void {
+            try self.reset();
+            switch (repo_kind) {
+                .git => try self.reader.skipBytes(position),
+                .xit => try self.reader.seekTo(position),
+            }
+        }
+
+        pub fn header(self: *const ObjectReader(repo_kind, repo_opts)) ObjectHeader {
+            return switch (repo_kind) {
+                .git => self.reader.header(),
+                .xit => self.reader.header,
+            };
+        }
+
+        fn stream(io_r: *std.Io.Reader, io_w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+            const r: *ObjectReader(repo_kind, repo_opts) = @alignCast(@fieldParentPtr("interface", io_r));
+            const dest = limit.slice(try io_w.writableSliceGreedy(1));
+            const size = r.reader.read(dest) catch return error.ReadFailed;
+            if (size == 0) return error.EndOfStream;
+            io_w.advance(size);
+            return size;
+        }
+    };
+}
+
+pub const ObjectHeader = struct {
+    kind: ObjectKind,
+    size: u64,
+
+    pub fn read(reader: *std.Io.Reader) !ObjectHeader {
+        const MAX_SIZE: usize = 16;
+
+        // read the object kind
+        var object_kind_buf: [MAX_SIZE]u8 = @splat(0);
+        var object_kind_writer = std.Io.Writer.fixed(&object_kind_buf);
+        const object_kind_size = try reader.streamDelimiter(&object_kind_writer, ' ');
+        const object_kind = object_kind_buf[0..object_kind_size];
+        reader.toss(1); // skip delimiter
+
+        // read the length
+        var object_len_buf: [MAX_SIZE]u8 = @splat(0);
+        var object_len_writer = std.Io.Writer.fixed(&object_len_buf);
+        const object_len_size = try reader.streamDelimiter(&object_len_writer, 0);
+        const object_len = try std.fmt.parseInt(u64, object_len_buf[0..object_len_size], 10);
+        reader.toss(1); // skip delimiter
+
+        return .{
+            .kind = try ObjectKind.init(object_kind),
+            .size = object_len,
+        };
+    }
+
+    pub fn write(self: ObjectHeader, buffer: []u8) ![]const u8 {
+        const type_name = self.kind.name();
+        const file_size = self.size;
+        return try std.mem.print(buffer, "{s} {}\x00", .{ type_name, file_size });
+    }
+};
+
+pub fn ObjectContent(comptime hash_kind: hash.HashKind) type {
+    return union(ObjectKind) {
+        blob,
+        tree: struct {
+            entries: std.array_hash_map.String(tr.TreeEntry(hash_kind)),
+        },
+        commit: struct {
+            tree: [hash.hexLen(hash_kind)]u8,
+            metadata: CommitMetadata(hash_kind),
+            message_position: u64,
+        },
+        tag: struct {
+            target: [hash.hexLen(hash_kind)]u8,
+            kind: ObjectKind,
+            name: []const u8,
+            tagger: []const u8,
+            message: []const u8,
+            message_position: u64,
+        },
+    };
+}
+
+pub fn Object(comptime repo_kind: rp.RepoKind, comptime repo_opts: rp.RepoOpts(repo_kind)) type {
+    return struct {
+        allocator: std.mem.Allocator,
+        arena: *std.heap.ArenaAllocator,
+        content: ObjectContent(repo_opts.hash),
+        oid: [hash.hexLen(repo_opts.hash)]u8,
+        len: u64,
+        object_reader: ObjectReader(repo_kind, repo_opts),
+
+        pub fn init(
+            state: rp.Repo(repo_kind, repo_opts).State(.read_only),
+            io: std.Io,
+            allocator: std.mem.Allocator,
+            oid: *const [hash.hexLen(repo_opts.hash)]u8,
+        ) !Object(repo_kind, repo_opts) {
+            var obj_rdr = try ObjectReader(repo_kind, repo_opts).init(state, io, allocator, oid);
+            errdefer obj_rdr.deinit();
+
+            const arena = try allocator.create(std.heap.ArenaAllocator);
+            arena.* = std.heap.ArenaAllocator.init(allocator);
+            errdefer {
+                arena.deinit();
+                allocator.destroy(arena);
+            }
+
+            const header = obj_rdr.header();
+
+            switch (header.kind) {
+                .blob => return .{
+                    .allocator = allocator,
+                    .arena = arena,
+                    .content = .{ .blob = {} },
+                    .oid = oid.*,
+                    .len = header.size,
+                    .object_reader = obj_rdr,
+                },
+                .tree => {
+                    if (header.size > repo_opts.max_tree_size) return error.TreeTooLarge;
+
+                    var entries: std.array_hash_map.String(tr.TreeEntry(repo_opts.hash)) = .empty;
+
+                    while (obj_rdr.interface.peekByte()) |_| {
+                        var entry_mode_buffer: [6]u8 = @splat(0);
+                        var entry_mode_writer = std.Io.Writer.fixed(&entry_mode_buffer);
+                        const entry_mode_size = try obj_rdr.interface.streamDelimiter(&entry_mode_writer, ' ');
+                        obj_rdr.interface.toss(1); // skip delimiter
+                        const entry_mode_str = entry_mode_buffer[0..entry_mode_size];
+                        const entry_mode: fs.Mode = @bitCast(try std.fmt.parseInt(u32, entry_mode_str, 8));
+
+                        var entry_name_writer = std.Io.Writer.Allocating.init(arena.allocator());
+                        _ = try obj_rdr.interface.streamDelimiterLimit(&entry_name_writer.writer, 0, .limited(repo_opts.max_read_size));
+                        obj_rdr.interface.toss(1); // skip delimiter
+
+                        const entry_name = entry_name_writer.written();
+                        if (!validTreeEntryName(entry_name)) return error.InvalidObject;
+                        var entry_oid: [hash.byteLen(repo_opts.hash)]u8 = @splat(0);
+                        try obj_rdr.interface.readSliceAll(&entry_oid);
+                        try entries.put(arena.allocator(), entry_name, .{ .oid = entry_oid, .mode = entry_mode });
+                    } else |err| switch (err) {
+                        error.EndOfStream => {},
+                        else => |e| return e,
+                    }
+
+                    return .{
+                        .allocator = allocator,
+                        .arena = arena,
+                        .content = ObjectContent(repo_opts.hash){ .tree = .{ .entries = entries } },
+                        .oid = oid.*,
+                        .len = header.size,
+                        .object_reader = obj_rdr,
+                    };
+                },
+                .commit => {
+                    var position: u64 = 0;
+
+                    // read the content kind
+                    var content_kind_writer = std.Io.Writer.Allocating.init(allocator);
+                    defer content_kind_writer.deinit();
+                    _ = try obj_rdr.interface.streamDelimiterLimit(&content_kind_writer.writer, ' ', .limited(repo_opts.max_read_size));
+                    obj_rdr.interface.toss(1); // skip delimiter
+                    const content_kind = content_kind_writer.written();
+                    if (!std.mem.eql(u8, "tree", content_kind)) {
+                        return error.InvalidObject;
+                    }
+                    position += content_kind.len + 1;
+
+                    // read the tree hash
+                    var tree_hash: [hash.hexLen(repo_opts.hash)]u8 = @splat(0);
+                    var tree_hash_writer = std.Io.Writer.fixed(&tree_hash);
+                    const tree_hash_size = try obj_rdr.interface.streamDelimiter(&tree_hash_writer, '\n');
+                    obj_rdr.interface.toss(1); // skip delimiter
+                    if (tree_hash_size != tree_hash.len) {
+                        return error.InvalidObject;
+                    }
+                    position += tree_hash.len + 1;
+
+                    var parent_oids: std.ArrayList([hash.hexLen(repo_opts.hash)]u8) = .empty;
+                    var metadata = CommitMetadata(repo_opts.hash){};
+
+                    // read the metadata
+                    while (true) {
+                        var line_writer = std.Io.Writer.Allocating.init(arena.allocator());
+                        _ = try obj_rdr.interface.streamDelimiterLimit(&line_writer.writer, '\n', .limited(repo_opts.max_read_size));
+                        obj_rdr.interface.toss(1); // skip delimiter
+
+                        const line = line_writer.written();
+                        position += line.len + 1;
+                        if (line.len == 0) {
+                            break;
+                        }
+                        if (std.mem.find(u8, line, " ")) |line_idx| {
+                            if (line_idx == line.len) {
+                                break;
+                            }
+                            const key = line[0..line_idx];
+                            const value = line[line_idx + 1 ..];
+
+                            if (std.mem.eql(u8, "parent", key)) {
+                                if (value.len != hash.hexLen(repo_opts.hash)) {
+                                    return error.InvalidObject;
+                                }
+                                try parent_oids.append(arena.allocator(), value[0..comptime hash.hexLen(repo_opts.hash)].*);
+                            } else if (std.mem.eql(u8, "author", key)) {
+                                metadata.author = value;
+                            } else if (std.mem.eql(u8, "committer", key)) {
+                                metadata.committer = value;
+                                var iter = std.mem.splitBackwardsScalar(u8, value, ' ');
+                                _ = iter.next(); // timezone
+                                if (iter.next()) |timestamp_str| {
+                                    metadata.timestamp = try std.fmt.parseInt(u64, timestamp_str, 0);
+                                }
+                            }
+                        }
+                    }
+
+                    metadata.parent_oids = parent_oids.items;
+
+                    // read only the first line; an overlong line is left empty
+                    {
+                        var line_writer = std.Io.Writer.Allocating.init(arena.allocator());
+                        const line_size_maybe = obj_rdr.interface.streamDelimiterLimit(&line_writer.writer, '\n', .limited(repo_opts.max_line_size)) catch |err| switch (err) {
+                            error.StreamTooLong => null,
+                            else => |e| return e,
+                        };
+
+                        // skip delimiter
+                        if (obj_rdr.interface.bufferedLen() > 0) {
+                            obj_rdr.interface.toss(1);
+                        }
+
+                        metadata.message = if (line_size_maybe != null) line_writer.written() else "";
+                    }
+
+                    return .{
+                        .allocator = allocator,
+                        .arena = arena,
+                        .content = .{
+                            .commit = .{
+                                .tree = tree_hash,
+                                .metadata = metadata,
+                                .message_position = position,
+                            },
+                        },
+                        .oid = oid.*,
+                        .len = header.size,
+                        .object_reader = obj_rdr,
+                    };
+                },
+                .tag => {
+                    var position: u64 = 0;
+
+                    // read the fields
+                    var fields: std.array_hash_map.String([]const u8) = .empty;
+                    defer fields.deinit(allocator);
+                    while (true) {
+                        var line_writer = std.Io.Writer.Allocating.init(arena.allocator());
+                        _ = try obj_rdr.interface.streamDelimiterLimit(&line_writer.writer, '\n', .limited(repo_opts.max_read_size));
+                        obj_rdr.interface.toss(1); // skip delimiter
+
+                        const line = line_writer.written();
+                        position += line.len + 1;
+                        if (line.len == 0) {
+                            break;
+                        }
+                        if (std.mem.find(u8, line, " ")) |line_idx| {
+                            if (line_idx == line.len) {
+                                break;
+                            }
+                            const key = line[0..line_idx];
+                            const value = line[line_idx + 1 ..];
+                            try fields.put(allocator, key, value);
+                        }
+                    }
+
+                    // init the content
+                    const target = fields.get("object") orelse return error.InvalidObject;
+                    if (target.len != hash.hexLen(repo_opts.hash)) {
+                        return error.InvalidObject;
+                    }
+                    var content = ObjectContent(repo_opts.hash){
+                        .tag = .{
+                            .target = target[0..comptime hash.hexLen(repo_opts.hash)].*,
+                            .kind = try ObjectKind.init(fields.get("type") orelse return error.InvalidObject),
+                            .name = fields.get("tag") orelse return error.InvalidObject,
+                            .tagger = fields.get("tagger") orelse return error.InvalidObject,
+                            .message = "",
+                            .message_position = position,
+                        },
+                    };
+
+                    // read only the first line; an overlong line is left empty
+                    {
+                        var line_writer = std.Io.Writer.Allocating.init(arena.allocator());
+                        const line_size_maybe = obj_rdr.interface.streamDelimiterLimit(&line_writer.writer, '\n', .limited(repo_opts.max_line_size)) catch |err| switch (err) {
+                            error.StreamTooLong => null,
+                            else => |e| return e,
+                        };
+
+                        // skip delimiter
+                        if (obj_rdr.interface.bufferedLen() > 0) {
+                            obj_rdr.interface.toss(1);
+                        }
+
+                        content.tag.message = if (line_size_maybe != null) line_writer.written() else "";
+                    }
+
+                    return .{
+                        .allocator = allocator,
+                        .arena = arena,
+                        .content = content,
+                        .oid = oid.*,
+                        .len = header.size,
+                        .object_reader = obj_rdr,
+                    };
+                },
+            }
+        }
+
+        pub fn initCommit(
+            state: rp.Repo(repo_kind, repo_opts).State(.read_only),
+            io: std.Io,
+            allocator: std.mem.Allocator,
+            oid: *const [hash.hexLen(repo_opts.hash)]u8,
+        ) !Object(repo_kind, repo_opts) {
+            var object = try Object(repo_kind, repo_opts).init(state, io, allocator, oid);
+            errdefer object.deinit();
+
+            switch (object.content) {
+                .blob, .tree => return error.CommitNotFound,
+                .commit => return object,
+                .tag => |tag| {
+                    const commit_object = try initCommit(state, io, allocator, &tag.target);
+                    object.deinit();
+                    return commit_object;
+                },
+            }
+        }
+
+        // append the whole message to `list`
+        pub fn readMessage(
+            self: *Object(repo_kind, repo_opts),
+            allocator: std.mem.Allocator,
+            list: *std.ArrayList(u8),
+            limit: std.Io.Limit,
+        ) !void {
+            const position = switch (self.content) {
+                .blob, .tree => return error.ObjectHasNoMessage,
+                .commit => |commit| commit.message_position,
+                .tag => |tag| tag.message_position,
+            };
+            try self.object_reader.seekTo(position);
+            try self.object_reader.interface.appendRemaining(allocator, list, limit);
+        }
+
+        pub fn deinit(self: *Object(repo_kind, repo_opts)) void {
+            self.arena.deinit();
+            self.allocator.destroy(self.arena);
+            self.object_reader.deinit();
+        }
+    };
+}
+
+fn validTreeEntryName(name: []const u8) bool {
+    if (name.len == 0 or
+        std.mem.eql(u8, name, ".") or
+        std.mem.eql(u8, name, ".."))
+    {
+        return false;
+    }
+
+    // a tree entry is one path component. backslash is a separator on
+    // windows, but a valid filename byte elsewhere.
+    if (std.mem.findScalar(u8, name, '/') != null) return false;
+    if (.windows == builtin.target.os.tag and std.mem.findScalar(u8, name, '\\') != null) return false;
+    return true;
+}
+
+test "validate tree entry names" {
+    try std.testing.expect(validTreeEntryName("file.txt"));
+    try std.testing.expect(validTreeEntryName(".gitignore"));
+    for (&[_][]const u8{ "", ".", "..", "../outside" }) |name| {
+        try std.testing.expect(!validTreeEntryName(name));
+    }
+    try std.testing.expectEqual(.windows != builtin.target.os.tag, validTreeEntryName("..\\outside"));
+}
+
+pub fn LogOptions(comptime hash_kind: hash.HashKind) type {
+    return struct {
+        start_oids: ?[]const [hash.hexLen(hash_kind)]u8 = null,
+        first_parent: bool = false,
+    };
+}
+
+pub const ObjectIteratorOptions = struct {
+    kind: enum {
+        all,
+        commit,
+    },
+    first_parent: bool = false,
+    max_depth: ?usize = null,
+};
+
+// same name hash git uses when sorting objects for delta compression
+// (pack_name_hash in git's pack-objects.h): the last few characters of
+// the name dominate, so files with the same extension/name hash together
+fn nameHash(name: []const u8) u32 {
+    var name_hash: u32 = 0;
+    for (name) |c| {
+        if (std.ascii.isWhitespace(c)) continue;
+        name_hash = (name_hash >> 2) +% (@as(u32, c) << 24);
+    }
+    return name_hash;
+}
+
+pub fn ObjectIterator(
+    comptime repo_kind: rp.RepoKind,
+    comptime repo_opts: rp.RepoOpts(repo_kind),
+) type {
+    return struct {
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        core: *rp.Repo(repo_kind, repo_opts).Core,
+        moment: rp.Repo(repo_kind, repo_opts).Moment(.read_only),
+        oid_queue: std.DoublyLinkedList,
+        oid_excludes: union(enum) {
+            memory: std.AutoHashMap([hash.hexLen(repo_opts.hash)]u8, void),
+            temp: TempDB.HashSet(.read_write),
+        },
+        object: Object(repo_kind, repo_opts),
+        depth: usize,
+        // hash of the tree entry name the current object was found under
+        // (zero for commits and root objects). used by the pack writer to
+        // group different versions of the same file when finding deltas.
+        name_hash: u32,
+        options: ObjectIteratorOptions,
+
+        const OidAndNode = struct {
+            oid: [hash.hexLen(repo_opts.hash)]u8,
+            depth: usize,
+            name_hash: u32,
+            node: std.DoublyLinkedList.Node,
+        };
+
+        pub const TempDB = @import("xitdb").Database(.buffered_file, hash.HashInt(repo_opts.hash));
+
+        pub fn initTemp(
+            state: rp.Repo(repo_kind, repo_opts).State(.read_only),
+            io: std.Io,
+            allocator: std.mem.Allocator,
+            options: ObjectIteratorOptions,
+            excludes: TempDB.HashSet(.read_write),
+        ) !ObjectIterator(repo_kind, repo_opts) {
+            var self = try init(state, io, allocator, options);
+            self.oid_excludes = .{ .temp = excludes };
+            return self;
+        }
+
+        pub fn init(
+            state: rp.Repo(repo_kind, repo_opts).State(.read_only),
+            io: std.Io,
+            allocator: std.mem.Allocator,
+            options: ObjectIteratorOptions,
+        ) !ObjectIterator(repo_kind, repo_opts) {
+            return .{
+                .io = io,
+                .allocator = allocator,
+                .core = state.core,
+                .moment = state.extra.moment.*,
+                .oid_queue = std.DoublyLinkedList{},
+                .oid_excludes = .{ .memory = std.AutoHashMap([hash.hexLen(repo_opts.hash)]u8, void).init(allocator) },
+                .object = undefined,
+                .depth = 0,
+                .name_hash = 0,
+                .options = options,
+            };
+        }
+
+        pub fn deinit(self: *ObjectIterator(repo_kind, repo_opts)) void {
+            while (self.oid_queue.popFirst()) |node| {
+                const oid_and_node: *OidAndNode = @fieldParentPtr("node", node);
+                self.allocator.destroy(oid_and_node);
+            }
+            switch (self.oid_excludes) {
+                .memory => |*memory| memory.deinit(),
+                .temp => {},
+            }
+        }
+
+        fn isExcluded(self: *ObjectIterator(repo_kind, repo_opts), oid: *const [hash.hexLen(repo_opts.hash)]u8) !bool {
+            return switch (self.oid_excludes) {
+                .memory => |*memory| memory.contains(oid.*),
+                .temp => |temp| try temp.getSlot(try hash.hexToInt(repo_opts.hash, oid)) != null,
+            };
+        }
+
+        pub fn putExcluded(self: *ObjectIterator(repo_kind, repo_opts), oid: *const [hash.hexLen(repo_opts.hash)]u8) !void {
+            switch (self.oid_excludes) {
+                .memory => |*memory| try memory.put(oid.*, {}),
+                .temp => |temp| try temp.put(try hash.hexToInt(repo_opts.hash, oid), .{ .uint = 1 }),
+            }
+        }
+
+        pub fn next(self: *ObjectIterator(repo_kind, repo_opts), allocator: std.mem.Allocator) !?*Object(repo_kind, repo_opts) {
+            const state = rp.Repo(repo_kind, repo_opts).State(.read_only){ .core = self.core, .extra = .{ .moment = &self.moment } };
+            while (self.oid_queue.popFirst()) |node| {
+                const oid_and_node: *OidAndNode = @fieldParentPtr("node", node);
+                const next_oid = oid_and_node.oid;
+                const node_depth = oid_and_node.depth;
+                const node_name_hash = oid_and_node.name_hash;
+                self.allocator.destroy(oid_and_node);
+
+                if (!try self.isExcluded(&next_oid)) {
+                    try self.putExcluded(&next_oid);
+                    self.depth = node_depth;
+                    self.name_hash = node_name_hash;
+
+                    var object = try Object(repo_kind, repo_opts).init(state, self.io, allocator, &next_oid);
+                    errdefer object.deinit();
+                    try self.includeContent(object.content, node_depth + 1);
+
+                    switch (self.options.kind) {
+                        .all => {},
+                        .commit => if (.commit != object.content) {
+                            object.deinit();
+                            continue;
+                        },
+                    }
+
+                    self.object = object;
+                    return &self.object;
+                }
+            }
+            return null;
+        }
+
+        fn includeContent(self: *ObjectIterator(repo_kind, repo_opts), content: ObjectContent(repo_opts.hash), child_depth: usize) !void {
+            switch (content) {
+                .blob => {},
+                .tree => |tree_content| switch (self.options.kind) {
+                    .all => for (tree_content.entries.keys(), tree_content.entries.values()) |name, entry| {
+                        if (entry.mode.content.object_type == .gitlink) continue;
+                        const entry_oid = std.fmt.bytesToHex(entry.oid, .lower);
+                        try self.includeWithName(&entry_oid, child_depth, nameHash(name));
+                    },
+                    .commit => {},
+                },
+                .commit => |commit_content| {
+                    if (commit_content.metadata.parent_oids) |parent_oids| {
+                        if (self.options.first_parent) {
+                            if (parent_oids.len > 0) {
+                                try self.includeAtDepth(&parent_oids[0], child_depth);
+                            }
+                        } else {
+                            for (parent_oids) |*parent_oid| {
+                                try self.includeAtDepth(parent_oid, child_depth);
+                            }
+                        }
+                    }
+                    switch (self.options.kind) {
+                        .all => try self.includeAtDepth(&commit_content.tree, child_depth),
+                        .commit => {},
+                    }
+                },
+                .tag => |tag| try self.includeAtDepth(&tag.target, child_depth),
+            }
+        }
+
+        pub fn include(self: *ObjectIterator(repo_kind, repo_opts), oid: *const [hash.hexLen(repo_opts.hash)]u8) !void {
+            try self.includeAtDepth(oid, 0);
+        }
+
+        pub fn includeAtDepth(self: *ObjectIterator(repo_kind, repo_opts), oid: *const [hash.hexLen(repo_opts.hash)]u8, item_depth: usize) !void {
+            try self.includeWithName(oid, item_depth, 0);
+        }
+
+        fn includeWithName(self: *ObjectIterator(repo_kind, repo_opts), oid: *const [hash.hexLen(repo_opts.hash)]u8, item_depth: usize, name_hash: u32) !void {
+            if (self.options.max_depth) |max| if (item_depth > max) return;
+            if (!try self.isExcluded(oid)) {
+                var oid_and_node = try self.allocator.create(OidAndNode);
+                errdefer self.allocator.free(oid_and_node);
+                oid_and_node.oid = oid.*;
+                oid_and_node.depth = item_depth;
+                oid_and_node.name_hash = name_hash;
+                oid_and_node.node = .{};
+                self.oid_queue.append(&oid_and_node.node);
+            }
+        }
+
+        pub fn exclude(self: *ObjectIterator(repo_kind, repo_opts), oid: *const [hash.hexLen(repo_opts.hash)]u8) !void {
+            try self.putExcluded(oid);
+
+            const state = rp.Repo(repo_kind, repo_opts).State(.read_only){ .core = self.core, .extra = .{ .moment = &self.moment } };
+            var object = try Object(repo_kind, repo_opts).init(state, self.io, self.allocator, oid);
+            defer object.deinit();
+            switch (object.content) {
+                .blob, .tag => {},
+                .tree => |tree| switch (self.options.kind) {
+                    .all => for (tree.entries.values()) |entry| {
+                        if (entry.mode.content.object_type == .gitlink) continue;
+                        const entry_oid = std.fmt.bytesToHex(entry.oid, .lower);
+                        // an already-excluded tree or blob has had its whole
+                        // subtree excluded, so there is no need to recurse
+                        if (!try self.isExcluded(&entry_oid)) {
+                            try self.exclude(&entry_oid);
+                        }
+                    },
+                    .commit => {},
+                },
+                .commit => |commit| {
+                    if (commit.metadata.parent_oids) |parent_oids| {
+                        if (self.options.first_parent) {
+                            if (parent_oids.len > 0) {
+                                try self.putExcluded(&parent_oids[0]);
+                            }
+                        } else {
+                            for (parent_oids) |*parent_oid| {
+                                try self.putExcluded(parent_oid);
+                            }
+                        }
+                    }
+                    switch (self.options.kind) {
+                        .all => if (!try self.isExcluded(&commit.tree)) {
+                            try self.exclude(&commit.tree);
+                        },
+                        .commit => {},
+                    }
+                },
+            }
+        }
+    };
+}
+
+pub fn copyFromObjectIterator(
+    comptime repo_kind: rp.RepoKind,
+    comptime repo_opts: rp.RepoOpts(repo_kind),
+    state: rp.Repo(repo_kind, repo_opts).State(.read_write),
+    comptime source_repo_kind: rp.RepoKind,
+    comptime source_repo_opts: rp.RepoOpts(source_repo_kind),
+    obj_iter: *ObjectIterator(source_repo_kind, source_repo_opts),
+    io: std.Io,
+    progress_ctx_maybe: ?repo_opts.ProgressCtx,
+) !void {
+    if (repo_opts.ProgressCtx != void) {
+        if (progress_ctx_maybe) |progress_ctx| {
+            try progress_ctx.run(io, .{ .start = .{
+                .kind = .writing_object,
+                .estimated_total_items = 0,
+            } });
+        }
+    }
+
+    while (try obj_iter.next(obj_iter.allocator)) |object| {
+        defer object.deinit();
+
+        // parsing the object during iteration may have consumed the reader,
+        // so rewind it before streaming the object's content
+        try object.object_reader.reset();
+
+        var oid: [hash.byteLen(repo_opts.hash)]u8 = @splat(0);
+        const header = object.object_reader.header();
+        try writeObject(
+            repo_kind,
+            repo_opts,
+            state,
+            io,
+            obj_iter.allocator,
+            &object.object_reader.interface,
+            header,
+            &oid,
+        );
+
+        if (repo_opts.ProgressCtx != void) {
+            if (progress_ctx_maybe) |progress_ctx| {
+                try progress_ctx.run(io, .{ .complete_one = .writing_object });
+            }
+        }
+    }
+
+    if (repo_opts.ProgressCtx != void) {
+        if (progress_ctx_maybe) |progress_ctx| {
+            try progress_ctx.run(io, .{ .end = .writing_object });
+        }
+    }
+}
+
+// with `check_references`, fails with error.MissingNecessaryObjects unless
+// every object the pack stored refers only to stored objects
+pub fn copyFromPackIterator(
+    comptime repo_kind: rp.RepoKind,
+    comptime repo_opts: rp.RepoOpts(repo_kind),
+    state: rp.Repo(repo_kind, repo_opts).State(.read_write),
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    pack_iter: *pack.PackIterator(repo_kind, repo_opts),
+    progress_ctx_maybe: ?repo_opts.ProgressCtx,
+    comptime check_references: bool,
+) !void {
+    if (check_references and repo_kind != .xit) @compileError("only the xit backend keeps every stored object's closure, so only it can check references");
+
+    if (repo_opts.ProgressCtx != void) {
+        if (progress_ctx_maybe) |progress_ctx| {
+            try progress_ctx.run(io, .{ .start = .{
+                .kind = .writing_object_from_pack,
+                .estimated_total_items = pack_iter.object_count,
+            } });
+        }
+    }
+
+    const OffsetToOid = pack.OffsetToOid(repo_opts.hash);
+    const offsets_file = try fs.createTempFile(io, state.core.repo_dir, state.core.temp_path);
+    defer offsets_file.close(io);
+    var offsets_buffer = std.Io.Writer.Allocating.init(allocator);
+    defer offsets_buffer.deinit();
+    var offsets_db = try OffsetToOid.DB.init(io, .{ .file = offsets_file, .buffer = &offsets_buffer, .fsync = false });
+
+    // the offsets are written in one transaction, so their writes aren't each committed
+    const Ctx = struct {
+        state: rp.Repo(repo_kind, repo_opts).State(.read_write),
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        pack_iter: *pack.PackIterator(repo_kind, repo_opts),
+        progress_ctx_maybe: ?repo_opts.ProgressCtx,
+
+        pub fn run(ctx: @This(), cursor: *OffsetToOid.DB.Cursor(.read_write)) !void {
+            var offset_to_oid = try OffsetToOid.init(cursor.*);
+            try copyFromPackIteratorWithOffsets(repo_kind, repo_opts, ctx.state, ctx.io, ctx.allocator, ctx.pack_iter, &offset_to_oid, ctx.progress_ctx_maybe);
+            if (check_references) {
+                try checkPackReferences(repo_opts, ctx.state.readOnly(), ctx.io, ctx.allocator, &offset_to_oid, ctx.pack_iter.object_count, ctx.progress_ctx_maybe);
+            }
+        }
+    };
+    try offsets_db.runContext(Ctx{
+        .state = state,
+        .io = io,
+        .allocator = allocator,
+        .pack_iter = pack_iter,
+        .progress_ctx_maybe = progress_ctx_maybe,
+    });
+
+    if (repo_opts.ProgressCtx != void) {
+        if (progress_ctx_maybe) |progress_ctx| {
+            try progress_ctx.run(io, .{ .end = .writing_object_from_pack });
+        }
+    }
+}
+
+fn copyFromPackIteratorWithOffsets(
+    comptime repo_kind: rp.RepoKind,
+    comptime repo_opts: rp.RepoOpts(repo_kind),
+    state: rp.Repo(repo_kind, repo_opts).State(.read_write),
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    pack_iter: *pack.PackIterator(repo_kind, repo_opts),
+    offset_to_oid: *pack.OffsetToOid(repo_opts.hash),
+    progress_ctx_maybe: ?repo_opts.ProgressCtx,
+) !void {
+    while (try pack_iter.next(state.readOnly(), offset_to_oid)) |pack_obj_rdr| {
+        defer pack_obj_rdr.deinit(io, allocator);
+
+        const Stream = struct {
+            reader: *pack.PackObjectReader(repo_kind, repo_opts),
+            interface: std.Io.Reader,
+
+            pub fn init(reader: *pack.PackObjectReader(repo_kind, repo_opts), buffer: []u8) @This() {
+                return .{
+                    .reader = reader,
+                    .interface = .{
+                        .vtable = &.{ .stream = stream },
+                        .buffer = buffer,
+                        .seek = 0,
+                        .end = 0,
+                    },
+                };
+            }
+
+            fn stream(io_r: *std.Io.Reader, io_w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+                const r: *@This() = @alignCast(@fieldParentPtr("interface", io_r));
+                const dest = limit.slice(try io_w.writableSliceGreedy(1));
+                const size = r.reader.read(dest) catch return error.ReadFailed;
+                if (size == 0) return error.EndOfStream;
+                io_w.advance(size);
+                return size;
+            }
+        };
+
+        var reader_buffer: [repo_opts.buffer_size]u8 = @splat(0);
+        var stream = Stream.init(pack_obj_rdr, &reader_buffer);
+
+        var oid: [hash.byteLen(repo_opts.hash)]u8 = @splat(0);
+        const header = pack_obj_rdr.header();
+        try writeObject(repo_kind, repo_opts, state, io, allocator, &stream.interface, header, &oid);
+
+        try offset_to_oid.put(pack_iter.start_position, &oid);
+
+        if (repo_opts.ProgressCtx != void) {
+            if (progress_ctx_maybe) |progress_ctx| {
+                try progress_ctx.run(io, .{ .complete_one = .writing_object_from_pack });
+            }
+        }
+    }
+}
+
+// whether the object is in the moment's object map
+pub fn isStored(
+    comptime repo_opts: rp.RepoOpts(.xit),
+    state: rp.Repo(.xit, repo_opts).State(.read_only),
+    oid: *const [hash.hexLen(repo_opts.hash)]u8,
+) !bool {
+    const cursor = (try state.extra.moment.getCursor(hash.hashInt(repo_opts.hash, "object-id->content"))) orelse return false;
+    const object_map = try rp.Repo(.xit, repo_opts).DB.CountedHashMap(.read_only).init(cursor);
+    return try object_map.getSlot(try hash.hexToInt(repo_opts.hash, oid)) != null;
+}
+
+// the xit backend keeps every stored object's closure stored: local writers
+// only refer to stored objects, and a pack from a client or remote must pass
+// this check. so each object a pack stored only needs its direct references
+// checked against the moment, which holds what was stored before plus the
+// whole pack, and the cost scales with the pack instead of the history.
+fn checkPackReferences(
+    comptime repo_opts: rp.RepoOpts(.xit),
+    state: rp.Repo(.xit, repo_opts).State(.read_only),
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    offset_to_oid: *pack.OffsetToOid(repo_opts.hash),
+    object_count: u32,
+    progress_ctx_maybe: ?repo_opts.ProgressCtx,
+) !void {
+    const DB = rp.Repo(.xit, repo_opts).DB;
+    // a pack that stored nothing has nothing to check
+    const object_map_cursor = (try state.extra.moment.getCursor(hash.hashInt(repo_opts.hash, "object-id->content"))) orelse return;
+    const object_map = try DB.CountedHashMap(.read_only).init(object_map_cursor);
+
+    if (repo_opts.ProgressCtx != void) {
+        if (progress_ctx_maybe) |progress_ctx| {
+            try progress_ctx.run(io, .{ .start = .{
+                .kind = .checking_object,
+                .estimated_total_items = object_count,
+            } });
+        }
+    }
+
+    const all_stored = blk: {
+        var iter = try offset_to_oid.map.readOnly().iterator();
+        while (try iter.next()) |entry_cursor| {
+            const kv_pair = try entry_cursor.readKeyValuePair();
+            var oid_bytes: [hash.byteLen(repo_opts.hash)]u8 = @splat(0);
+            if ((try kv_pair.value_cursor.readBytes(&oid_bytes)).len != oid_bytes.len) return error.InvalidOffsetEntry;
+            const oid = std.fmt.bytesToHex(oid_bytes, .lower);
+
+            var object = try Object(.xit, repo_opts).init(state, io, allocator, &oid);
+            defer object.deinit();
+            switch (object.content) {
+                .blob => {},
+                .tree => |tree| for (tree.entries.values()) |entry| {
+                    if (entry.mode.content.object_type == .gitlink) continue;
+                    if (try object_map.getSlot(hash.bytesToInt(repo_opts.hash, &entry.oid)) == null) break :blk false;
+                },
+                .commit => |commit| {
+                    for (commit.metadata.parent_oids orelse &.{}) |*parent_oid| {
+                        if (try object_map.getSlot(try hash.hexToInt(repo_opts.hash, parent_oid)) == null) break :blk false;
+                    }
+                    if (try object_map.getSlot(try hash.hexToInt(repo_opts.hash, &commit.tree)) == null) break :blk false;
+                },
+                .tag => |tag| if (try object_map.getSlot(try hash.hexToInt(repo_opts.hash, &tag.target)) == null) break :blk false,
+            }
+
+            if (repo_opts.ProgressCtx != void) {
+                if (progress_ctx_maybe) |progress_ctx| {
+                    try progress_ctx.run(io, .{ .complete_one = .checking_object });
+                }
+            }
+        }
+        break :blk true;
+    };
+
+    if (repo_opts.ProgressCtx != void) {
+        if (progress_ctx_maybe) |progress_ctx| {
+            try progress_ctx.run(io, .{ .end = .checking_object });
+        }
+    }
+
+    if (!all_stored) return error.MissingNecessaryObjects;
+}
