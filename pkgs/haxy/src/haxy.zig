@@ -17,6 +17,8 @@ const sys = core.sys;
 const Allocator = std.mem.Allocator;
 const Oid = git.Oid;
 
+pub const stack = @import("stack.zig");
+
 pub const BRANCH = "haxy/events";
 pub const LOCAL = "refs/heads/" ++ BRANCH;
 pub const REMOTE = "refs/remotes/origin/" ++ BRANCH;
@@ -59,22 +61,38 @@ pub fn tip(repo: *git.Repo) ?Oid {
     return repo.refOid(LOCAL) orelse repo.refOid(REMOTE);
 }
 
+/// One event: `data` null removes the record `id` names.
+pub const Event = struct { id: []const u8, kind: []const u8, data: ?std.json.ObjectMap, commit: git.Repo.Commit };
+
+/// Every event on the events branch, in replay order.
+pub fn events(a: Allocator, repo: *git.Repo) ![]Event {
+    const head = tip(repo) orelse return &.{};
+    var out: std.ArrayList(Event) = .empty;
+    for (try replayOrder(a, repo, head)) |c| {
+        if (c.parents.len > 1) continue; // a merge, not an event
+        const ev = std.json.parseFromSliceLeaky(std.json.Value, a, c.message, .{}) catch continue;
+        if (ev != .object) continue;
+        try out.append(a, .{
+            .id = str(ev.object.get("id")) orelse continue,
+            .kind = str(ev.object.get("kind")) orelse continue,
+            .data = if (ev.object.get("data")) |d| (if (d == .object) d.object else null) else null,
+            .commit = c,
+        });
+    }
+    return out.items;
+}
+
 /// Every issue on the events branch (removed ones dropped), newest first.
 pub fn issues(a: Allocator, repo: *git.Repo) ![]Issue {
-    const head = tip(repo) orelse return &.{};
-    const order = try replayOrder(a, repo, head);
-
     var by_id: std.StringArrayHashMapUnmanaged(Issue) = .empty;
     const C = struct { thread: []const u8, comment: Comment };
     var comment_ids: std.StringArrayHashMapUnmanaged(?C) = .empty;
 
-    for (order) |c| {
-        if (c.parents.len > 1) continue; // a merge, not an event
-        const ev = std.json.parseFromSliceLeaky(std.json.Value, a, c.message, .{}) catch continue;
-        if (ev != .object) continue;
-        const id = str(ev.object.get("id")) orelse continue;
-        const kind = str(ev.object.get("kind")) orelse continue;
-        const data: ?std.json.ObjectMap = if (ev.object.get("data")) |d| (if (d == .object) d.object else null) else null;
+    for (try events(a, repo)) |e| {
+        const c = e.commit;
+        const id = e.id;
+        const kind = e.kind;
+        const data = e.data;
         if (std.mem.eql(u8, kind, "issue")) {
             const d = data orelse {
                 _ = by_id.orderedRemove(id);
@@ -136,12 +154,12 @@ pub fn find(list: []const Issue, id: []const u8) !Issue {
     return found orelse sys.fail("no issue `{s}`", .{id});
 }
 
-fn str(v: ?std.json.Value) ?[]const u8 {
+pub fn str(v: ?std.json.Value) ?[]const u8 {
     const x = v orelse return null;
     return if (x == .string) x.string else null;
 }
 
-fn splitLabels(a: Allocator, labels: []const u8) ![]const []const u8 {
+pub fn splitLabels(a: Allocator, labels: []const u8) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     var it = std.mem.tokenizeAny(u8, labels, " ,");
     while (it.next()) |l| try out.append(a, l);
@@ -324,12 +342,14 @@ pub fn open(a: Allocator, root: []const u8, name: []const u8) !*git.Repo {
     return git.open(a, root, name);
 }
 
-/// Sync every selected repo that has events on either side; one line per repo
-/// synced, others skipped silently.
-pub fn syncAll(a: Allocator, root: []const u8, names: []const []const u8, id: core.Identity, w: *std.Io.Writer) !void {
+/// Sync every selected repo that has events on either side, and with
+/// `with_root` the root repo (where a workspace's stacks live when the root is a
+/// git repo); one line per repo synced, others skipped silently.
+pub fn syncAll(a: Allocator, root: []const u8, names: []const []const u8, with_root: bool, id: core.Identity, w: *std.Io.Writer) !void {
     var failed: std.ArrayList([]const u8) = .empty;
-    for (names) |name| {
-        const p = try std.fs.path.join(a, &.{ root, name });
+    const all = if (with_root) try std.mem.concat(a, []const u8, &.{ &.{stack.ROOT}, names }) else names;
+    for (all) |name| {
+        const p = if (std.mem.eql(u8, name, stack.ROOT)) root else try std.fs.path.join(a, &.{ root, name });
         const repo = git.Repo.open(a, p) catch continue;
         defer repo.close();
         const s = sync(repo, id) catch |e| {
@@ -430,4 +450,5 @@ test "event json is haxy's" {
 
 test {
     std.testing.refAllDecls(@This());
+    _ = stack;
 }

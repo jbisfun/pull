@@ -176,7 +176,7 @@ fn run(a: Allocator, cmd: cli.Cmd) !void {
                 else => 1,
             });
         },
-        .haxy_sync, .haxy_issues, .haxy_show, .haxy_new, .haxy_comment, .haxy_status, .haxy_open => if (opts.haxy) try haxyCmd(a, root, pf, cmd),
+        .haxy_sync, .haxy_issues, .haxy_show, .haxy_new, .haxy_comment, .haxy_status, .haxy_open, .haxy_patch, .haxy_stacks, .haxy_stack, .haxy_merge, .haxy_pin, .haxy_checkout => if (opts.haxy) try haxyCmd(a, root, &pf, cmd),
         .each => |argv| {
             var map = try sys.envMap(a);
             for (try ws.env(a, root, pf)) |v| try map.put(v.key, v.value);
@@ -195,12 +195,18 @@ fn run(a: Allocator, cmd: cli.Cmd) !void {
 }
 
 /// `pull haxy ...` (the `haxy` feature).
-fn haxyCmd(a: Allocator, root: []const u8, pf: core.Pullfile, cmd: cli.Cmd) !void {
+fn haxyCmd(a: Allocator, root: []const u8, pfp: *core.Pullfile, cmd: cli.Cmd) !void {
+    const pf = pfp.*;
     var w: std.Io.Writer.Allocating = .init(a);
     defer sys.outBytes(w.written());
     const o = &w.writer;
+    const st = haxy.stack;
     switch (cmd) {
-        .haxy_sync => |names| try haxy.syncAll(a, root, try haxy.select(a, pf, names), try identity(a, root, pf), o),
+        .haxy_sync => |names| {
+            // the root repo too, when it holds the workspace's stacks
+            const with_root = names.len == 0 and if (try st.eventsRepo(a, root, pf)) |e| std.mem.eql(u8, e.name, st.ROOT) else false;
+            try haxy.syncAll(a, root, try haxy.select(a, pf, names), with_root, try identity(a, root, pf), o);
+        },
         .haxy_issues => |x| {
             const only: []const []const u8 = if (x.repo) |r| &.{r} else &.{};
             const repos = try haxy.collect(a, root, try haxy.select(a, pf, only), x.all);
@@ -234,22 +240,188 @@ fn haxyCmd(a: Allocator, root: []const u8, pf: core.Pullfile, cmd: cli.Cmd) !voi
                 try o.print("{s}: {s} {s}\n", .{ x.repo, verb, i.id });
             } else try o.print("{s}: {s} is already {s}\n", .{ x.repo, x.issue, @tagName(status) });
         },
-        .haxy_open => |name| {
-            const repo = try haxyRepo(a, root, pf, name);
+        .haxy_open => |name_opt| {
             // haxy's local mode authors events from the repo's user.name/user.email
             // config, so pin those to pull's identity instead of the global git one.
             const id = try identity(a, root, pf);
-            try repo.setConfig("user.name", id.name);
-            try repo.setConfig("user.email", id.email);
-            repo.close();
-            var map = try sys.envMap(a);
-            for (try ws.env(a, root, pf)) |v| try map.put(v.key, v.value);
-            const term = sys.runInherit(&.{"haxy"}, .{ .cwd = repo.path, .env = &map }) catch |e|
+            const dir = if (name_opt) |name| blk: {
+                const repo = try haxyRepo(a, root, pf, name);
+                defer repo.close();
+                try repo.setConfig("user.name", id.name);
+                try repo.setConfig("user.email", id.email);
+                break :blk repo.path;
+            } else blk: {
+                try pinHaxyIdentity(a, root, pf, id);
+                break :blk root;
+            };
+            const argv: []const []const u8 = if (name_opt == null) &.{ "haxy", "--workspace", root } else &.{"haxy"};
+            const term = sys.runInherit(argv, .{ .cwd = dir, .env = try haxyEnv(a, root, pf) }) catch |e|
                 return sys.fail("running haxy: {s}", .{sys.describe(e)});
             std.process.exit(sys.exitCode(term));
         },
+        .haxy_patch => |x| {
+            const members = try st.candidates(a, root, pf, x.branch);
+            if (members.len == 0) return sys.fail("no repo has work on {s}", .{if (x.branch) |b| try std.fmt.allocPrint(a, "branch `{s}`", .{b}) else "a branch other than its pullfile one"});
+            const title = x.title orelse members[0].branch;
+            try pinHaxyIdentity(a, root, pf, try identity(a, root, pf));
+            const out = try runHaxy(a, root, pf, try st.newArgs(a, root, title, x.body, x.labels, members));
+            const Created = struct { id: []const u8, members: []const st.Member };
+            const created = std.json.parseFromSliceLeaky(Created, a, out, .{ .ignore_unknown_fields = true }) catch
+                return sys.fail("haxy stack new: unexpected output: {s}", .{out});
+            try o.print("stack {s}: {s}\n", .{ created.id, title });
+            for (created.members, 0..) |m, i| try o.print("  {s}: patch {s} ({s} -> {s})\n", .{ m.repo, m.patch_id, members[i].branch, pfp.repo(m.repo).?.branch });
+        },
+        .haxy_stacks => |x| {
+            const ev, const repo = try st.openEvents(a, root, pf);
+            defer repo.close();
+            const list = try st.stacks(a, repo);
+            if (x.json) {
+                try std.json.Stringify.value(.{ .events = ev.name, .root = root, .stacks = list }, .{ .whitespace = .indent_2 }, o);
+                return o.writeByte('\n');
+            }
+            try st.writeList(o, list);
+        },
+        .haxy_stack => |x| {
+            if (x.json) {
+                try pinHaxyIdentity(a, root, pf, try identity(a, root, pf));
+                const ev, const repo = try st.openEvents(a, root, pf);
+                _ = ev;
+                const s = try st.find(try st.stacks(a, repo), x.id);
+                repo.close();
+                return o.writeAll(try runHaxy(a, root, pf, &.{ "haxy", "stack", "show", "--workspace", root, s.id }));
+            }
+            const s, const infos = try stackWithPatches(a, root, pf, x.id);
+            try st.writeStack(o, s, infos);
+        },
+        .haxy_merge => |x| {
+            const ev, const repo = try st.openEvents(a, root, pf);
+            _ = ev;
+            const s = try st.find(try st.stacks(a, repo), x.id);
+            repo.close();
+            if (!std.mem.eql(u8, s.status, "merged")) {
+                try pinHaxyIdentity(a, root, pf, try identity(a, root, pf));
+                _ = try runHaxy(a, root, pf, &.{ "haxy", "stack", "merge", "--workspace", root, s.id });
+                try o.print("stack {s}: merged {d} repo{s}\n", .{ s.id, s.members.len, if (s.members.len == 1) "" else "s" });
+            }
+            sys.outBytes(w.written());
+            w.clearRetainingCapacity();
+            try pinStack(a, root, pfp, s.id, x.message);
+        },
+        .haxy_pin => |x| try pinStack(a, root, pfp, x.id, x.message),
+        .haxy_checkout => |x| if (opts.worktree) {
+            const s, const infos = try stackWithPatches(a, root, pf, x.id);
+            const name = x.name orelse try std.fmt.allocPrint(a, "stack-{s}", .{s.id[0..@min(8, s.id.len)]});
+            const dest = try worktree.path(a, root, name);
+            if (!sys.exists(dest)) {
+                try core.paths.ensureIgnored(a, root, "/" ++ worktree.DIR ++ "/");
+                _ = try worktree.add(a, root, pf, name, name);
+            }
+            // each member's worktree branch starts at its patch's source branch
+            for (s.members, infos) |m, info| {
+                const i = info orelse return sys.fail("{s}: no patch {s}", .{ m.repo, m.patch_id });
+                const source = i.source_branch orelse return sys.fail("{s}: patch {s} comes from a fork", .{ m.repo, m.patch_id });
+                const dir = try std.fs.path.join(a, &.{ dest, m.repo });
+                const res = try sys.run(a, &.{ "git", "-C", dir, "switch", "--quiet", "-C", name, source }, .{});
+                if (!res.ok()) return sys.fail("{s}: {s}", .{ m.repo, std.mem.trim(u8, res.stderr, " \r\n") });
+                try o.print("{s}: {s} at {s}\n", .{ m.repo, name, source });
+            }
+            try o.print("workspace: {s}\n", .{dest});
+        } else return sys.fail("built without the `worktree` feature", .{}),
         else => unreachable,
     }
+}
+
+/// A stack and its member patches as their repos' events have them.
+fn stackWithPatches(a: Allocator, root: []const u8, pf: core.Pullfile, id: []const u8) !struct { haxy.stack.Stack, []const ?haxy.stack.PatchInfo } {
+    const st = haxy.stack;
+    _, const repo = try st.openEvents(a, root, pf);
+    defer repo.close();
+    const s = try st.find(try st.stacks(a, repo), id);
+    const infos = try a.alloc(?st.PatchInfo, s.members.len);
+    for (s.members, infos) |m, *info| {
+        info.* = null;
+        const p = try std.fs.path.join(a, &.{ root, m.repo });
+        const r = git.Repo.open(a, p) catch continue;
+        defer r.close();
+        info.* = try st.patchInfo(a, r, m.patch_id);
+    }
+    return .{ s, infos };
+}
+
+/// Record a merged stack's commits as the pins, and commit the pullfile as `pull
+/// commit` does: precommit hook (which may stage the pullfile elsewhere), then one
+/// signed commit in every repo with staged changes and the root repo.
+fn pinStack(a: Allocator, root: []const u8, pf: *core.Pullfile, id: []const u8, message: ?[]const u8) !void {
+    const st = haxy.stack;
+    _, const repo = try st.openEvents(a, root, pf.*);
+    const s = try st.find(try st.stacks(a, repo), id);
+    repo.close();
+    if (!std.mem.eql(u8, s.status, "merged")) return sys.fail("stack {s} is {s}; `pull haxy merge` it first", .{ s.id[0..8], s.status });
+
+    var changed: usize = 0;
+    for (s.pins) |p| {
+        const r = pf.repo(p.repo) orelse return sys.fail("stack {s}: no repo `{s}` in the pullfile", .{ s.id[0..8], p.repo });
+        if (r.commit) |c| if (std.mem.eql(u8, c, p.commit)) continue;
+        r.commit = p.commit;
+        changed += 1;
+    }
+    if (changed == 0) return sys.out("stack {s}: already pinned\n", .{s.id[0..8]});
+    // the pin commit must hold only the pins
+    if ((try git.stagedRepos(a, root, pf.*)).len > 0) return sys.fail("repos have staged changes; commit or unstage them first", .{});
+
+    const id_ = try identity(a, root, pf.*);
+    const msg = blk: {
+        const want = try core.message.prettify(a, message orelse s.title);
+        if ((try ws.lint(a, pf.*, want)).len == 0) break :blk want;
+        if (message != null) {
+            for (try ws.lint(a, pf.*, want)) |v| sys.err("lint: {s}\n", .{v});
+            return sys.fail("commit message rejected", .{});
+        }
+        const fallback = try std.fmt.allocPrint(a, "pin stack {s}", .{s.id[0..8]});
+        for (try ws.lint(a, pf.*, fallback)) |v| sys.err("lint: {s}\n", .{v});
+        if ((try ws.lint(a, pf.*, fallback)).len > 0) return sys.fail("commit message rejected; pass --message", .{});
+        break :blk fallback;
+    };
+    // saved first, so a hook copying the pullfile copies the new pins
+    try pf.save(root);
+    const extra = [_]core.EnvVar{.{ .key = "PULL_MESSAGE", .value = msg }};
+    try ws.runHook(a, .precommit, root, pf.*, &.{}, &extra);
+    const targets = try git.stagedRepos(a, root, pf.*);
+    try git.commit(a, root, pf, targets, id_, msg);
+    try ws.runHook(a, .postcommit, root, pf.*, targets, &extra);
+    for (s.pins) |p| sys.out("{s}: pinned {s}\n", .{ p.repo, p.commit[0..@min(8, p.commit.len)] });
+}
+
+/// haxy authors events from each repo's user.name/user.email, so pin those to
+/// pull's identity in every repo a workspace-wide haxy may write to.
+fn pinHaxyIdentity(a: Allocator, root: []const u8, pf: core.Pullfile, id: core.Identity) !void {
+    if (git.rootRepo(a, root)) |r| {
+        defer r.close();
+        try r.setConfig("user.name", id.name);
+        try r.setConfig("user.email", id.email);
+    }
+    for (pf.repos.items) |entry| {
+        const p = try std.fs.path.join(a, &.{ root, entry.name });
+        const r = git.Repo.open(a, p) catch continue;
+        defer r.close();
+        try r.setConfig("user.name", id.name);
+        try r.setConfig("user.email", id.email);
+    }
+}
+
+fn haxyEnv(a: Allocator, root: []const u8, pf: core.Pullfile) !*std.process.Environ.Map {
+    const map = try a.create(std.process.Environ.Map);
+    map.* = try sys.envMap(a);
+    for (try ws.env(a, root, pf)) |v| try map.put(v.key, v.value);
+    return map;
+}
+
+/// Run a `haxy` command in the workspace env; its stdout, or its stderr as the error.
+fn runHaxy(a: Allocator, root: []const u8, pf: core.Pullfile, argv: []const []const u8) ![]const u8 {
+    const res = sys.run(a, argv, .{ .cwd = root, .env = try haxyEnv(a, root, pf) }) catch |e|
+        return sys.fail("running haxy: {s}", .{sys.describe(e)});
+    if (!res.ok()) return sys.fail("{s}", .{std.mem.trim(u8, res.stderr, " \r\n")});
+    return res.stdout;
 }
 
 fn haxyRepo(a: Allocator, root: []const u8, pf: core.Pullfile, name: []const u8) !*git.Repo {

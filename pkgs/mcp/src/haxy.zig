@@ -76,6 +76,12 @@ pub const defs = &[_]mcp.Def{
     },
 };
 
+/// Whether the root repo holds the workspace's stacks (so sync includes it).
+fn rootHoldsStacks(a: Allocator, root: []const u8, pf: core.Pullfile) bool {
+    const ev = (haxy.stack.eventsRepo(a, root, pf) catch return false) orelse return false;
+    return std.mem.eql(u8, ev.name, haxy.stack.ROOT);
+}
+
 fn names(a: Allocator, pf: core.Pullfile, only: ?[]const u8) ![]const []const u8 {
     return haxy.select(a, pf, if (only) |r| &.{r} else &.{});
 }
@@ -166,7 +172,7 @@ fn sync(ctx: *const Ctx, a: Allocator, args: Args) !Result {
         .err => |m| return .{ .err = m },
     };
     var w: std.Io.Writer.Allocating = .init(a);
-    haxy.syncAll(a, ctx.root, try names(a, pf, args.str("repo")), try identity(ctx, a, pf), &w.writer) catch |e|
+    haxy.syncAll(a, ctx.root, try names(a, pf, args.str("repo")), args.str("repo") == null and rootHoldsStacks(a, ctx.root, pf), try identity(ctx, a, pf), &w.writer) catch |e|
         return .{ .err = try std.fmt.allocPrint(a, "{s}{s}", .{ w.written(), tools.describe(a, e) }) };
     return .{ .ok = if (w.written().len == 0) "no repo has a haxy/events branch" else w.written() };
 }

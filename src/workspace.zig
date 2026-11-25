@@ -31,6 +31,7 @@ const SECTIONS = [_]struct { []const u8, []const u8 }{
     .{ "ignore", "ignore" },
     .{ "jobs", "launchd" },
     .{ "tool", "tool" },
+    .{ "haxy", "haxy" },
 };
 
 /// Say so when the pullfile configures something this build can't do (the section

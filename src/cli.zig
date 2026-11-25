@@ -59,7 +59,14 @@ pub const Cmd = union(enum) {
     haxy_new: struct { repo: []const u8, title: []const u8, body: []const u8, labels: []const u8 },
     haxy_comment: struct { repo: []const u8, issue: []const u8, text: []const u8 },
     haxy_status: struct { repo: []const u8, issue: []const u8, close: bool },
-    haxy_open: []const u8,
+    /// No repo: the whole workspace (haxy's workspace mode).
+    haxy_open: ?[]const u8,
+    haxy_patch: struct { title: ?[]const u8, body: []const u8, labels: []const u8, branch: ?[]const u8 },
+    haxy_stacks: struct { json: bool },
+    haxy_stack: struct { id: []const u8, json: bool },
+    haxy_merge: struct { id: []const u8, message: ?[]const u8 },
+    haxy_pin: struct { id: []const u8, message: ?[]const u8 },
+    haxy_checkout: struct { id: []const u8, name: ?[]const u8 },
 };
 
 // ---------------------------------------------------------------- help data
@@ -99,7 +106,7 @@ const top_commands = [_]Sub{
     .{ .name = "session", .about = "tmux-style terminal sessions (headless jobs a human can attach to and an agent can drive), started with the workspace env", .enabled = opts.launchd },
     .{ .name = "worktree", .about = "Workspace worktrees under .worktrees/NAME (every repo as a git worktree)", .enabled = opts.worktree },
     .{ .name = "tool", .about = "Workspace packages: pullfile `tool` (Brewfile-style), poured from Linuxbrew bottles and linked into .pull/tool (on PATH in `pull env`)", .enabled = opts.tool },
-    .{ .name = "haxy", .about = "Issues on haxy's `haxy/events` branch: list, file, comment, close, sync, open the haxy TUI", .enabled = opts.haxy },
+    .{ .name = "haxy", .about = "haxy issues and stacks (changes across repos, landed together): list, file, comment, sync, patch, merge, open the haxy TUI", .enabled = opts.haxy },
     .{ .name = "each", .about = "Run a command in every cloned repo (e.g. `pull each git log -1`)" },
 };
 
@@ -111,7 +118,13 @@ const haxy_commands = [_]Sub{
     .{ .name = "comment", .about = "Comment on an issue" },
     .{ .name = "close", .about = "Close an issue" },
     .{ .name = "reopen", .about = "Reopen an issue" },
-    .{ .name = "open", .about = "Run `haxy` (its TUI, and web UI on a local port) in a repo" },
+    .{ .name = "open", .about = "Run `haxy` (its TUI, and web UI on a local port) in a repo, or over the whole workspace" },
+    .{ .name = "patch", .about = "Turn the work on branches across repos into haxy patches and one stack" },
+    .{ .name = "stacks", .about = "List the workspace's stacks" },
+    .{ .name = "stack", .about = "One stack with its member patches" },
+    .{ .name = "merge", .about = "Merge every patch of a stack (all or none), then pin the merged commits" },
+    .{ .name = "pin", .about = "Pin a merged stack's commits in the pullfile and commit it (as `pull commit` does)" },
+    .{ .name = "checkout", .about = "A worktree workspace with each member's branch checked out" },
 };
 
 const repo_commands = [_]Sub{
@@ -262,7 +275,13 @@ fn leafHelp(a: Allocator, path: []const u8) !?[]const u8 {
         .{ "haxy comment", .{ .about = aboutOf(&haxy_commands, "comment"), .usage = "pull haxy comment <REPO> <ISSUE> <TEXT>", .args = &.{ .{ "<REPO>", "" }, .{ "<ISSUE>", "Issue id (a unique prefix will do)" }, .{ "<TEXT>", "" } }, .options = &.{help_flag} } },
         .{ "haxy close", .{ .about = aboutOf(&haxy_commands, "close"), .usage = "pull haxy close <REPO> <ISSUE>", .args = &.{ .{ "<REPO>", "" }, .{ "<ISSUE>", "Issue id (a unique prefix will do)" } }, .options = &.{help_flag} } },
         .{ "haxy reopen", .{ .about = aboutOf(&haxy_commands, "reopen"), .usage = "pull haxy reopen <REPO> <ISSUE>", .args = &.{ .{ "<REPO>", "" }, .{ "<ISSUE>", "Issue id (a unique prefix will do)" } }, .options = &.{help_flag} } },
-        .{ "haxy open", .{ .about = aboutOf(&haxy_commands, "open"), .usage = "pull haxy open <REPO>", .args = &.{.{ "<REPO>", "" }}, .options = &.{help_flag} } },
+        .{ "haxy open", .{ .about = aboutOf(&haxy_commands, "open"), .usage = "pull haxy open [REPO]", .args = &.{.{ "[REPO]", "Just this repo (default: the workspace)" }}, .options = &.{help_flag} } },
+        .{ "haxy patch", .{ .about = aboutOf(&haxy_commands, "patch"), .usage = "pull haxy patch [OPTIONS]", .args = &.{}, .options = &.{ .{ "-t, --title <TITLE>", "Default: the branch name" }, .{ "-b, --body <BODY>", "Description (markdown)" }, .{ "-l, --labels <LABELS>", "Space-separated" }, .{ "    --branch <NAME>", "Repos with this branch (default: repos checked out on a branch other than their pullfile one)" }, help_flag } } },
+        .{ "haxy stacks", .{ .about = aboutOf(&haxy_commands, "stacks"), .usage = "pull haxy stacks [OPTIONS]", .args = &.{}, .options = &.{ .{ "    --json", "Machine-readable: {root, stacks: [{author, created, description, id, labels, members, pins, status, title, updated}]}" }, help_flag } } },
+        .{ "haxy stack", .{ .about = aboutOf(&haxy_commands, "stack"), .usage = "pull haxy stack [OPTIONS] <STACK>", .args = &.{.{ "<STACK>", "Stack id (a unique prefix will do)" }}, .options = &.{ .{ "    --json", "haxy's view: each member's patch and whether it merges" }, help_flag } } },
+        .{ "haxy merge", .{ .about = aboutOf(&haxy_commands, "merge"), .usage = "pull haxy merge [OPTIONS] <STACK>", .args = &.{.{ "<STACK>", "Stack id (a unique prefix will do)" }}, .options = &.{ .{ "-m, --message <MESSAGE>", "The pin commit's message (default: the stack title)" }, help_flag } } },
+        .{ "haxy pin", .{ .about = aboutOf(&haxy_commands, "pin"), .usage = "pull haxy pin [OPTIONS] <STACK>", .args = &.{.{ "<STACK>", "Stack id (a unique prefix will do)" }}, .options = &.{ .{ "-m, --message <MESSAGE>", "The pin commit's message (default: the stack title)" }, help_flag } } },
+        .{ "haxy checkout", .{ .about = aboutOf(&haxy_commands, "checkout"), .usage = "pull haxy checkout <STACK> [NAME]", .args = &.{ .{ "<STACK>", "Stack id (a unique prefix will do)" }, .{ "[NAME]", "Worktree name (default: stack-<id prefix>)" } }, .options = &.{help_flag} } },
     };
     for (leaves) |l| if (std.mem.eql(u8, l[0], path)) return try render(a, l[1]);
     if (std.mem.eql(u8, path, "repo")) return try groupHelp(a, "repo", aboutOf(&top_commands, "repo"), &repo_commands);
@@ -805,7 +824,56 @@ fn parseHaxy(a: Allocator, sub: []const u8, iter: *ArgIter) !Cmd {
     }
     if (eq(u8, sub, "open")) {
         const res = try parseSub(a, "haxy open", &positional, iter);
-        return .{ .haxy_open = (try one(a, "haxy open", res.positionals[0])) orelse return missing(a, "", "<REPO>", "pull haxy open <REPO>") };
+        return .{ .haxy_open = try one(a, "haxy open", res.positionals[0]) };
+    }
+    if (eq(u8, sub, "patch")) {
+        const res = try parseSub(a, "haxy patch", &comptime clap.parseParamsComptime(
+            \\-h, --help
+            \\-t, --title <str>
+            \\-b, --body <str>
+            \\-l, --labels <str>
+            \\--branch <str>
+            \\
+        ), iter);
+        return .{ .haxy_patch = .{ .title = res.args.title, .body = res.args.body orelse "", .labels = res.args.labels orelse "", .branch = res.args.branch } };
+    }
+    if (eq(u8, sub, "stacks")) {
+        const res = try parseSub(a, "haxy stacks", &comptime clap.parseParamsComptime(
+            \\-h, --help
+            \\--json
+            \\
+        ), iter);
+        return .{ .haxy_stacks = .{ .json = res.args.json != 0 } };
+    }
+    if (eq(u8, sub, "stack")) {
+        const res = try parseSub(a, "haxy stack", &comptime clap.parseParamsComptime(
+            \\-h, --help
+            \\--json
+            \\<str>...
+            \\
+        ), iter);
+        const id = (try one(a, "haxy stack", res.positionals[0])) orelse return missing(a, "", "<STACK>", "pull haxy stack <STACK>");
+        return .{ .haxy_stack = .{ .id = id, .json = res.args.json != 0 } };
+    }
+    if (eq(u8, sub, "merge") or eq(u8, sub, "pin")) {
+        const params = comptime clap.parseParamsComptime(
+            \\-h, --help
+            \\-m, --message <str>
+            \\<str>...
+            \\
+        );
+        const merge = eq(u8, sub, "merge");
+        const res = if (merge) try parseSub(a, "haxy merge", &params, iter) else try parseSub(a, "haxy pin", &params, iter);
+        const id = (try one(a, if (merge) "haxy merge" else "haxy pin", res.positionals[0])) orelse
+            return missing(a, "", "<STACK>", if (merge) "pull haxy merge <STACK>" else "pull haxy pin <STACK>");
+        return if (merge) .{ .haxy_merge = .{ .id = id, .message = res.args.message } } else .{ .haxy_pin = .{ .id = id, .message = res.args.message } };
+    }
+    if (eq(u8, sub, "checkout")) {
+        const res = try parseSub(a, "haxy checkout", &positional, iter);
+        const ps = res.positionals[0];
+        if (ps.len == 0) return missing(a, "", "<STACK>", "pull haxy checkout <STACK> [NAME]");
+        if (ps.len > 2) return usageError(a, "haxy checkout", "unexpected argument '{s}' found", .{ps[2]});
+        return .{ .haxy_checkout = .{ .id = ps[0], .name = if (ps.len == 2) ps[1] else null } };
     }
     // show / comment / close / reopen: REPO ISSUE (+ TEXT for comment).
     const path = try std.fmt.allocPrint(a, "haxy {s}", .{sub});
