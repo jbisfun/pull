@@ -91,6 +91,8 @@ pub const HttpStream = struct {
         if (self.wire_state.body_writer) |*body_writer| {
             try body_writer.writer.writeAll(buffer[0..len]);
             try body_writer.flush();
+            // pull patch: BodyWriter.flush only flushes the TLS layer; push it to the socket.
+            if (self.wire_state.write_request) |*req| try req.connection.?.flush();
         } else {
             var request = try HttpRequest.init(allocator, self);
             defer request.deinit(allocator);
@@ -183,11 +185,15 @@ pub const HttpStream = struct {
             .{ .name = "accept", .value = request.accept },
         };
 
-        var body_writer = try req.sendBody(&.{});
+        // pull patch: store the request before sendBody, so the BodyWriter's
+        // client_request pointer refers to the stored request, not this stack copy.
+        self.wire_state.write_request = req;
+        const stored = &self.wire_state.write_request.?;
+        var body_writer = try stored.sendBody(&.{});
         try body_writer.writer.writeAll(buffer);
         try body_writer.flush();
+        try stored.connection.?.flush();
 
-        self.wire_state.write_request = req;
         self.wire_state.body_writer = body_writer;
     }
 
@@ -199,8 +205,11 @@ pub const HttpStream = struct {
         var reader = &req.reader.interface;
 
         if (!self.wire_state.sent_write_request) {
-            var body_writer = self.wire_state.body_writer orelse return error.BodyWriterNotFound;
+            const body_writer = if (self.wire_state.body_writer) |*bw| bw else return error.BodyWriterNotFound;
             try body_writer.end();
+            // pull patch: like std's sendBodyComplete, flush the connection (TLS + socket)
+            // after ending the body; otherwise https servers wait and answer 408.
+            try req.connection.?.flush();
 
             var response = try req.receiveHead(&.{});
             try self.handleResponse(response.head, false);
