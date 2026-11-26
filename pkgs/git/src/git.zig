@@ -83,14 +83,33 @@ fn syncOne(a: Allocator, root: []const u8, r: *core.Repo, to_upstream: bool, ext
         repo.remoteOid(r.branch)
     else if (r.commit) |c| try repo_mod.parseOid(c) else null;
     if (target) |t| if (try repo.fastForward(t)) sys.out("{s}: -> {s}\n", .{ r.name, short(t) });
-    if (to_upstream) {
-        if (repo.headOid()) |h| {
-            if (r.commit == null or !std.mem.eql(u8, r.commit.?, &h)) {
-                r.commit = try a.dupe(u8, &h);
-                changed.* = true;
-            }
-        }
-    }
+    if (to_upstream) if (repo.headOid()) |h| {
+        if (try repin(a, r, &h)) changed.* = true;
+    };
+}
+
+/// `pull update`'s re-pin: move an existing pin to `head`. A repo without a
+/// `commit` key is deliberately unpinned (it follows its branch) and stays so.
+fn repin(a: Allocator, r: *core.Repo, head: []const u8) !bool {
+    const pin = r.commit orelse return false;
+    if (std.mem.eql(u8, pin, head)) return false;
+    r.commit = try a.dupe(u8, head);
+    return true;
+}
+
+test "update refreshes pins and leaves unpinned repos unpinned" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const old = "1111111111111111111111111111111111111111";
+    const new = "2222222222222222222222222222222222222222";
+    var pinned: core.Repo = .{ .name = "p", .upstream = "u", .branch = "main", .commit = old };
+    var unpinned: core.Repo = .{ .name = "f", .upstream = "u", .branch = "main" };
+    try std.testing.expect(try repin(a, &pinned, new));
+    try std.testing.expectEqualStrings(new, pinned.commit.?);
+    try std.testing.expect(!try repin(a, &pinned, new));
+    try std.testing.expect(!try repin(a, &unpinned, new));
+    try std.testing.expect(unpinned.commit == null);
 }
 
 /// Human-readable status of every repo.
