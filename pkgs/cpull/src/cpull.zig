@@ -53,6 +53,10 @@ pub const Comment = struct {
 
 /// Fields in key order (`--json` output is sorted like the rest of pull's JSON).
 pub const Issue = struct {
+    /// The line of code a report points at (cpull's `anchor`: file, line,
+    /// line_text, quote, commit, source), kept as is so a status change keeps
+    /// it. Absent (not null) in `--json` output when the issue has none.
+    anchor: ?std.json.Value = null,
     /// Who opened it (`Name <email>`).
     author: []const u8,
     comments: []const Comment = &.{},
@@ -157,6 +161,7 @@ pub fn issues(a: Allocator, repo: *git.Repo) ![]Issue {
                 .description = str(d.get("description")) orelse "",
                 .labels = try splitLabels(a, str(d.get("labels")) orelse ""),
                 .status = if (std.mem.eql(u8, str(d.get("status")) orelse "open", "closed")) .closed else .open,
+                .anchor = if (d.get("anchor")) |v| (if (v == .object) v else null) else null,
             };
         } else if (std.mem.eql(u8, kind, "comment")) {
             const g = try comment_ids.getOrPut(a, id);
@@ -276,7 +281,8 @@ fn newId() [32]u8 {
 /// Commit one event onto the local branch (continuing from origin's when there is
 /// no local one yet, as cpull does), with a fresh empty tree.
 fn commitEvent(a: Allocator, repo: *git.Repo, id: core.Identity, event: anytype) !Oid {
-    const json = try std.json.Stringify.valueAlloc(a, event, .{});
+    // optional fields (an issue's anchor) are left out when unset, as cpull does
+    const json = try std.json.Stringify.valueAlloc(a, event, .{ .emit_null_optional_fields = false });
     if (json.len > MAX_EVENT) return sys.fail("event too large ({d} bytes, cpull allows {d})", .{ json.len, MAX_EVENT });
     const parent = tip(repo);
     const oid = try repo.commitObject(id, try repo.emptyTree(), if (parent) |p| &.{p} else &.{}, json, sys.now());
@@ -285,7 +291,7 @@ fn commitEvent(a: Allocator, repo: *git.Repo, id: core.Identity, event: anytype)
 }
 
 /// cpull's Issue event fields, in its order.
-const IssueData = struct { title: []const u8, description: []const u8, labels: []const u8, status: Status };
+const IssueData = struct { title: []const u8, description: []const u8, labels: []const u8, status: Status, anchor: ?std.json.Value = null };
 const CommentData = struct { thread_id: []const u8, parent_id: []const u8, body: []const u8 };
 
 fn issueEvent(issue_id: []const u8, d: IssueData) struct { id: []const u8, kind: []const u8 = "issue", data: IssueData } {
@@ -317,6 +323,7 @@ pub fn setStatus(a: Allocator, repo: *git.Repo, id: core.Identity, issue_ref: []
         .description = issue.description,
         .labels = try std.mem.join(a, " ", issue.labels),
         .status = status,
+        .anchor = issue.anchor,
     }));
     return issue;
 }
@@ -482,7 +489,7 @@ const Date = struct {
 
 /// `--json`: `{repos: [{issues, name, path}], root}`.
 pub fn writeJson(w: *std.Io.Writer, root: []const u8, repos: []const RepoIssues) !void {
-    try std.json.Stringify.value(.{ .repos = repos, .root = root }, .{ .whitespace = .indent_2 }, w);
+    try std.json.Stringify.value(.{ .repos = repos, .root = root }, .{ .whitespace = .indent_2, .emit_null_optional_fields = false }, w);
     try w.writeByte('\n');
 }
 
@@ -492,7 +499,7 @@ test "event json is cpull's" {
     const a = arena.allocator();
     try std.testing.expectEqualStrings(
         \\{"id":"00ff","kind":"issue","data":{"title":"t \"q\"","description":"d\nx","labels":"bug ui","status":"open"}}
-    , try std.json.Stringify.valueAlloc(a, issueEvent("00ff", .{ .title = "t \"q\"", .description = "d\nx", .labels = "bug ui", .status = .open }), .{}));
+    , try std.json.Stringify.valueAlloc(a, issueEvent("00ff", .{ .title = "t \"q\"", .description = "d\nx", .labels = "bug ui", .status = .open }), .{ .emit_null_optional_fields = false }));
     try std.testing.expectEqual(@as(usize, 32), newId().len);
     try std.testing.expectEqual(@as(usize, 2), (try splitLabels(a, "a, b")).len);
     try std.testing.expectEqualStrings("2026-11-25 20:38 UTC", try std.fmt.allocPrint(a, "{f}", .{Date{ .secs = 1795639091 }}));

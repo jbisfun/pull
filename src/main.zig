@@ -180,7 +180,7 @@ fn run(a: Allocator, cmd: cli.Cmd) !void {
                 else => 1,
             });
         },
-        .cpull_sync, .cpull_issues, .cpull_show, .cpull_new, .cpull_comment, .cpull_status, .cpull_open, .cpull_patch, .cpull_stacks, .cpull_stack, .cpull_merge, .cpull_pin, .cpull_checkout => if (opts.cpull) try cpullCmd(a, root, &pf, cmd),
+        .cpull_sync, .cpull_issues, .cpull_show, .cpull_new, .cpull_comment, .cpull_status, .cpull_open, .cpull_patch, .cpull_stacks, .cpull_stack, .cpull_merge, .cpull_pin, .cpull_checkout, .cpull_report => if (opts.cpull) try cpullCmd(a, root, &pf, cmd),
         .each => |argv| {
             var map = try sys.envMap(a);
             for (try ws.env(a, root, pf)) |v| try map.put(v.key, v.value);
@@ -317,6 +317,14 @@ fn cpullCmd(a: Allocator, root: []const u8, pfp: *core.Pullfile, cmd: cli.Cmd) !
             try pinStack(a, root, pfp, s.id, x.message);
         },
         .cpull_pin => |x| try pinStack(a, root, pfp, x.id, x.message),
+        .cpull_report => |args| {
+            // cpull authors the report from the repo's identity, which pull pins
+            try pinCpullIdentity(a, root, pf, try identity(a, root, pf));
+            const argv = try std.mem.concat(a, []const u8, &.{ &.{ "cpull", "report", "--workspace", root }, args });
+            const term = sys.runInherit(argv, .{ .cwd = root, .env = try cpullEnv(a, root, pf) }) catch |e|
+                return sys.fail("running cpull: {s}", .{sys.describe(e)});
+            std.process.exit(sys.exitCode(term));
+        },
         .cpull_checkout => |x| if (opts.worktree) {
             const s, const infos = try cpull.stack.withPatches(a, root, pf, x.id);
             const name = x.name orelse try std.fmt.allocPrint(a, "stack-{s}", .{s.id[0..@min(8, s.id.len)]});

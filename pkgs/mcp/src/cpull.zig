@@ -114,7 +114,76 @@ pub const defs = &[_]mcp.Def{
         .fields = &.{ .{ "stack", .string }, .{ "message", .opt_string } },
         .run = merge,
     },
+    // ------------------------------------------------ reports (what radar was)
+    .{
+        .name = "cpull_report",
+        .description = "File a report: a cpull issue anchored to a line of code, in the repo it points at (`pull cpull report`). The line's text is read from the file and the note becomes the issue description. Returns the report id (a cpull issue id) and its location.",
+        .schema =
+        \\{"$schema":"https://json-schema.org/draft/2020-12/schema","properties":{"file":{"description":"Path relative to the repo.","type":"string"},"line":{"description":"1-based line number.","minimum":1,"type":"integer"},"note":{"description":"What's wrong here, why, and the fix (markdown).","type":["string","null"]},"quote":{"description":"The selected text, if narrower than the line.","type":["string","null"]},"repo":{"description":"Repo name from the pullfile, or . for the workspace's events repo.","type":"string"},"source":{"description":"Where the report came from (default \"mcp\").","type":["string","null"]},"title":{"description":"Default: the note's first line.","type":["string","null"]}},"required":["repo","file","line"],"type":"object"}
+        ,
+        .fields = &.{ .{ "repo", .string }, .{ "file", .string }, .{ "line", .opt_u64 }, .{ "note", .opt_string }, .{ "quote", .opt_string }, .{ "source", .opt_string }, .{ "title", .opt_string } },
+        .run = report,
+    },
+    .{
+        .name = "cpull_reports",
+        .description = "Reports (line-anchored cpull issues) across every repo, oldest first: id, repo/file:line, filing time, the line's text and the note. Open ones unless `all`.",
+        .schema =
+        \\{"$schema":"https://json-schema.org/draft/2020-12/schema","properties":{"all":{"default":false,"description":"Closed reports too.","type":"boolean"}},"type":"object"}
+        ,
+        .fields = &.{.{ "all", .boolean }},
+        .run = reports,
+    },
+    .{
+        .name = "cpull_report_show",
+        .description = "One report: where it points, its note and its web UI path.",
+        .schema = report_schema,
+        .fields = &.{.{ "id", .string }},
+        .run = reportShow,
+    },
+    .{
+        .name = "cpull_report_close",
+        .description = "Close a report (its cpull issue).",
+        .schema = report_schema,
+        .fields = &.{.{ "id", .string }},
+        .run = reportClose,
+    },
+    .{
+        .name = "cpull_report_reopen",
+        .description = "Reopen a closed report.",
+        .schema = report_schema,
+        .fields = &.{.{ "id", .string }},
+        .run = reportReopen,
+    },
 };
+
+const report_schema =
+    \\{"$schema":"https://json-schema.org/draft/2020-12/schema","properties":{"id":{"description":"Report id (a unique prefix will do).","type":"string"}},"required":["id"],"type":"object"}
+;
+
+fn report(ctx: *const Ctx, a: Allocator, args: Args) !Result {
+    const line = args.int("line") orelse return .{ .err = "line is required" };
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(a, &.{ "cpull", "report", args.str("repo").?, args.str("file").?, try std.fmt.allocPrint(a, "{d}", .{line}), "--source", args.str("source") orelse "mcp" });
+    inline for (.{ .{ "note", "--note" }, .{ "quote", "--quote" }, .{ "title", "--title" } }) |f|
+        if (args.str(f[0])) |v| try argv.appendSlice(a, &.{ f[1], v });
+    return runPull(ctx, a, argv.items);
+}
+
+fn reports(ctx: *const Ctx, a: Allocator, args: Args) !Result {
+    return runPull(ctx, a, if (args.flag("all")) &.{ "cpull", "report", "list", "--all" } else &.{ "cpull", "report", "list" });
+}
+
+fn reportShow(ctx: *const Ctx, a: Allocator, args: Args) !Result {
+    return runPull(ctx, a, &.{ "cpull", "report", "show", args.str("id").? });
+}
+
+fn reportClose(ctx: *const Ctx, a: Allocator, args: Args) !Result {
+    return runPull(ctx, a, &.{ "cpull", "report", "close", args.str("id").? });
+}
+
+fn reportReopen(ctx: *const Ctx, a: Allocator, args: Args) !Result {
+    return runPull(ctx, a, &.{ "cpull", "report", "reopen", args.str("id").? });
+}
 
 /// Whether the root repo holds the workspace's stacks (so sync includes it).
 fn rootHoldsStacks(a: Allocator, root: []const u8, pf: core.Pullfile) bool {

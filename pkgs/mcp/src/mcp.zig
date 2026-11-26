@@ -136,5 +136,5 @@ test {
     _ = tools;
     if (opts.sessions) _ = sessions;
     if (opts.cpull) _ = cpull;
-    try std.testing.expect(defs().len == @as(usize, if (opts.sessions) 15 else 8) + if (opts.cpull) 11 else 0);
+    try std.testing.expect(defs().len == @as(usize, if (opts.sessions) 15 else 8) + if (opts.cpull) 16 else 0);
 }

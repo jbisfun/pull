@@ -67,6 +67,8 @@ pub const Cmd = union(enum) {
     cpull_merge: struct { id: []const u8, message: ?[]const u8 },
     cpull_pin: struct { id: []const u8, message: ?[]const u8 },
     cpull_checkout: struct { id: []const u8, name: ?[]const u8 },
+    /// `cpull report ARGS...`, passed through to the cpull binary.
+    cpull_report: []const []const u8,
 };
 
 // ---------------------------------------------------------------- help data
@@ -126,6 +128,7 @@ const cpull_commands = [_]Sub{
     .{ .name = "merge", .about = "Merge every patch of a stack (all or none), then pin the merged commits" },
     .{ .name = "pin", .about = "Pin a merged stack's commits in the pullfile and commit it (as `pull commit` does)" },
     .{ .name = "checkout", .about = "A worktree workspace with each member's branch checked out" },
+    .{ .name = "report", .about = "Line-anchored issues (what radar was): file one on a line of code, list, show, close, reopen, migrate radar.db (runs `cpull report`)" },
 };
 
 const repo_commands = [_]Sub{
@@ -282,6 +285,7 @@ fn leafHelp(a: Allocator, path: []const u8) !?[]const u8 {
         .{ "cpull stack", .{ .about = aboutOf(&cpull_commands, "stack"), .usage = "pull cpull stack [OPTIONS] <STACK>", .args = &.{.{ "<STACK>", "Stack id (a unique prefix will do)" }}, .options = &.{ .{ "    --json", "cpull's view: each member's patch and whether it merges" }, help_flag } } },
         .{ "cpull merge", .{ .about = aboutOf(&cpull_commands, "merge"), .usage = "pull cpull merge [OPTIONS] <STACK>", .args = &.{.{ "<STACK>", "Stack id (a unique prefix will do)" }}, .options = &.{ .{ "-m, --message <MESSAGE>", "The pin commit's message (default: the stack title)" }, help_flag } } },
         .{ "cpull pin", .{ .about = aboutOf(&cpull_commands, "pin"), .usage = "pull cpull pin [OPTIONS] <STACK>", .args = &.{.{ "<STACK>", "Stack id (a unique prefix will do)" }}, .options = &.{ .{ "-m, --message <MESSAGE>", "The pin commit's message (default: the stack title)" }, help_flag } } },
+        .{ "cpull report", .{ .about = aboutOf(&cpull_commands, "report"), .usage = "pull cpull report <REPO> <FILE> <LINE> [-q QUOTE] [-n NOTE] | list [--all] [--json] | show|close|reopen <ID> | migrate <RADAR_JSON>", .args = &.{ .{ "<REPO>", "Pullfile repo, or . for the workspace's events repo" }, .{ "<FILE>", "Path relative to the repo" }, .{ "<LINE>", "1-based; its text is read from the file" }, .{ "<ID>", "Report (issue) id; a unique prefix will do" }, .{ "<RADAR_JSON>", "`radar list --all --json` output, - for stdin" } }, .options = &.{ .{ "-q, --quote <TEXT>", "The selected text, when narrower than the line" }, .{ "-n, --note <TEXT>", "What's wrong (the issue description)" }, .{ "    --title <TITLE>", "Default: the note's first line" }, .{ "    --labels <LABELS>", "Added to `report`" }, .{ "    --source <SOURCE>", "cli (default), wiki, ycode, mcp" }, .{ "    --all", "list: closed ones too" }, .{ "    --json", "Machine-readable: [{id, repo, file, line, line_text, quote, note, title, status, source, commit, created, author, url}]" }, help_flag } } },
         .{ "cpull checkout", .{ .about = aboutOf(&cpull_commands, "checkout"), .usage = "pull cpull checkout <STACK> [NAME]", .args = &.{ .{ "<STACK>", "Stack id (a unique prefix will do)" }, .{ "[NAME]", "Worktree name (default: stack-<id prefix>)" } }, .options = &.{help_flag} } },
     };
     for (leaves) |l| if (std.mem.eql(u8, l[0], path)) return try render(a, l[1]);
@@ -875,6 +879,7 @@ fn parseCpull(a: Allocator, sub: []const u8, iter: *ArgIter) !Cmd {
             return missing(a, "", "<STACK>", if (merge) "pull cpull merge <STACK>" else "pull cpull pin <STACK>");
         return if (merge) .{ .cpull_merge = .{ .id = id, .message = res.args.message } } else .{ .cpull_pin = .{ .id = id, .message = res.args.message } };
     }
+    if (eq(u8, sub, "report")) return .{ .cpull_report = try rest(a, "cpull report", iter) };
     if (eq(u8, sub, "checkout")) {
         const res = try parseSub(a, "cpull checkout", &positional, iter);
         const ps = res.positionals[0];
