@@ -77,7 +77,7 @@ With the default `email = none`, commits are written as `name <>`, so no email g
     pull init [--org X]            create pullfile.plist and local.toml
     pull repo add URL [--name] [--branch]   |  repo rm NAME  |  repo list
     pull sync                      clone missing repos, fetch, fast-forward to the pins
-    pull update                    fast-forward to upstream branches and re-pin
+    pull update                    fast-forward to upstream branches, refresh existing pins
     pull status [--json]           --json: root, features, lint rules, per-repo
                                    branch/head/pin, ahead/behind and changed files
     pull add PATHS...              each path is staged in the repo that contains it
@@ -144,12 +144,16 @@ that branch too (to `origin/cpull/events`), `pull push` pushes it when it is ahe
     pull cpull sync [REPO...]                   fetch, fast-forward or merge, push
     pull cpull open [REPO]                      run `cpull` (TUI + local web UI) there,
                                                or over the whole workspace
+        [--web-listen ADDR] [--ci-jobs N] [--ci-watch] [--ci-watch-interval S]
+        [-- CPULL_ARGS...]                     no TUI / CI options / any other cpull flags
 
 ISSUE is an id or a unique prefix of one. Events are written as cpull's local mode writes
 them, with pull's identity (and GPG signature), so `cpull` reads them; sync is cpull's own
 (an empty-tree merge commit when both sides moved). Listing replays the events (local
-branch, else origin's); concurrent edits of one issue resolve by causal order then time,
-where cpull would flag a field conflict.
+branch, else origin's) for authors and times, and takes the values from `cpull records`:
+cpull merges concurrent edits of one issue or stack field by field (and flags the
+conflict), so pull shows what cpull shows. Without a `cpull` on PATH that has `records`,
+the replay alone decides (causal order, then time).
 
 Before the rename the feature was `haxy` (`pull haxy ...` still works, hidden). Migration
 is automatic and one-time: a repo with a `haxy/events` branch (local or origin's) and no

@@ -7,7 +7,8 @@
 //!    "members":"<repo> <patch id>\n..","status":{"open":{}}}}
 //!
 //! and, once merged, `"status":{"merged":{"pins":"<repo> <oid>\n.."}}`. Stacks are
-//! read here by replaying events, like issues; creating and merging them is
+//! read here by replaying events, like issues, with cpull's merged values
+//! (`cpull.Merged`); creating and merging them is
 //! cpull's (`cpull stack new|merge|show`), which pull runs, since a patch carries
 //! revision snapshots only cpull computes. Recording the pins is pull's: it owns
 //! the pullfile and its signed commits.
@@ -65,8 +66,24 @@ pub fn openEvents(a: Allocator, root: []const u8, pf: core.Pullfile) !struct { E
     return .{ ev, repo };
 }
 
-/// Every stack (removed ones dropped), newest first.
+/// Every stack (removed ones dropped), newest first, with cpull's merged values.
 pub fn stacks(a: Allocator, repo: *git.Repo) ![]Stack {
+    return stacksWith(a, repo, try cpull.mergedOne(a, repo.path));
+}
+
+fn setStackData(a: Allocator, s: *Stack, d: std.json.ObjectMap) !void {
+    const status = d.get("status");
+    const status_name = statusName(status);
+    s.title = cpull.str(d.get("title")) orelse "";
+    s.description = cpull.str(d.get("description")) orelse "";
+    s.labels = try cpull.splitLabels(a, cpull.str(d.get("labels")) orelse "");
+    s.members = try parseMembers(a, cpull.str(d.get("members")) orelse "");
+    s.status = status_name;
+    s.pins = if (std.mem.eql(u8, status_name, "merged")) try parsePins(a, cpull.str(status.?.object.get("merged").?.object.get("pins")) orelse "") else &.{};
+}
+
+/// `stacks`, with the record values taken from `m` (cpull's merge) when given.
+pub fn stacksWith(a: Allocator, repo: *git.Repo, m: ?cpull.Merged) ![]Stack {
     var by_id: std.StringArrayHashMapUnmanaged(Stack) = .empty;
     for (try cpull.events(a, repo)) |e| {
         if (!std.mem.eql(u8, e.kind, "stack")) continue;
@@ -76,20 +93,29 @@ pub fn stacks(a: Allocator, repo: *git.Repo) ![]Stack {
         };
         const g = try by_id.getOrPut(a, e.id);
         const first = !g.found_existing;
-        const status = d.get("status");
-        const status_name = statusName(status);
         g.value_ptr.* = .{
             .author = if (first) e.commit.author else g.value_ptr.author,
             .created = if (first) e.commit.time else g.value_ptr.created,
             .updated = e.commit.time,
             .id = e.id,
-            .title = cpull.str(d.get("title")) orelse "",
-            .description = cpull.str(d.get("description")) orelse "",
-            .labels = try cpull.splitLabels(a, cpull.str(d.get("labels")) orelse ""),
-            .members = try parseMembers(a, cpull.str(d.get("members")) orelse ""),
-            .status = status_name,
-            .pins = if (std.mem.eql(u8, status_name, "merged")) try parsePins(a, cpull.str(status.?.object.get("merged").?.object.get("pins")) orelse "") else &.{},
+            .title = "",
+            .description = "",
+            .labels = &.{},
+            .members = &.{},
+            .status = "open",
         };
+        try setStackData(a, g.value_ptr, d);
+    }
+    if (m) |x| {
+        var i: usize = 0;
+        while (i < by_id.count()) {
+            const d = x.stacks.get(by_id.keys()[i]) orelse {
+                by_id.orderedRemoveAt(i);
+                continue;
+            };
+            try setStackData(a, &by_id.values()[i], d);
+            i += 1;
+        }
     }
     const out = try a.dupe(Stack, by_id.values());
     std.mem.reverse(Stack, out);

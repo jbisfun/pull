@@ -5,10 +5,14 @@
 //! author line naming who made it. Merges of two event histories are commits with
 //! two parents and no event. See cpull's docs/event.md and docs/local.md.
 //!
-//! Issues are read by replaying the events (latest event per id wins, in causal
-//! order: a commit's generation, then commit time) from the local branch, else
-//! origin's. New events are written exactly as cpull's local mode writes them, so
-//! `cpull` itself consumes them. Sync is cpull's own: fetch origin's branch,
+//! Issues are read by replaying the events (in causal order: a commit's
+//! generation, then commit time) from the local branch, else origin's, for who
+//! made a record and when. cpull is the source of truth for the values: after two
+//! histories merge it merges each record field by field against the merge base,
+//! which a linear replay can't reproduce, so the replayed records take their data
+//! from `cpull records` (see `Merged`) whenever cpull can be run. New events are
+//! written exactly as cpull's local mode writes them, so `cpull` itself consumes
+//! them. Sync is cpull's own: fetch origin's branch,
 //! fast-forward or make an empty-tree merge commit, push.
 const std = @import("std");
 const core = @import("core");
@@ -134,8 +138,65 @@ pub fn events(a: Allocator, repo: *git.Repo) ![]Event {
     return out.items;
 }
 
-/// Every issue on the events branch (removed ones dropped), newest first.
+/// cpull's merged state of one repo's records (`cpull records`): per kind, the
+/// data of every record it keeps, by id. A record missing here was removed by
+/// cpull's merge.
+pub const Merged = struct {
+    issues: std.StringHashMapUnmanaged(std.json.ObjectMap) = .empty,
+    comments: std.StringHashMapUnmanaged(std.json.ObjectMap) = .empty,
+    stacks: std.StringHashMapUnmanaged(std.json.ObjectMap) = .empty,
+};
+
+/// `Merged` for each of `paths` (repo dirs), from one `cpull records` run; an
+/// entry is null where cpull couldn't say (cpull missing or too old to have
+/// `records`, or the repo unreadable), and the replay alone stands there.
+pub fn merged(a: Allocator, paths: []const []const u8) ![]?Merged {
+    const out = try a.alloc(?Merged, paths.len);
+    @memset(out, null);
+    if (paths.len == 0) return out;
+    const argv = try std.mem.concat(a, []const u8, &.{ &.{ "cpull", "records" }, paths });
+    const res = sys.run(a, argv, .{}) catch return out;
+    if (!res.ok()) return out;
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, res.stdout, .{}) catch return out;
+    if (parsed != .array or parsed.array.items.len != paths.len) return out;
+    for (parsed.array.items, out) |repo, *m| {
+        if (repo != .object or repo.object.get("error") != null) continue;
+        var x: Merged = .{};
+        inline for (.{ "issues", "comments", "stacks" }) |kind| {
+            const list = repo.object.get(kind) orelse std.json.Value{ .null = {} };
+            if (list == .array) for (list.array.items) |row| {
+                if (row != .object) continue;
+                const id = str(row.object.get("id")) orelse continue;
+                const data = row.object.get("data") orelse continue;
+                if (data == .object) try @field(x, kind).put(a, id, data.object);
+            };
+        }
+        m.* = x;
+    }
+    return out;
+}
+
+/// `merged` for one repo.
+pub fn mergedOne(a: Allocator, path: []const u8) !?Merged {
+    return (try merged(a, &.{path}))[0];
+}
+
+/// Every issue on the events branch (removed ones dropped), newest first, with
+/// cpull's merged values.
 pub fn issues(a: Allocator, repo: *git.Repo) ![]Issue {
+    return issuesWith(a, repo, try mergedOne(a, repo.path));
+}
+
+fn setIssueData(a: Allocator, i: *Issue, d: std.json.ObjectMap) !void {
+    i.title = str(d.get("title")) orelse "";
+    i.description = str(d.get("description")) orelse "";
+    i.labels = try splitLabels(a, str(d.get("labels")) orelse "");
+    i.status = if (std.mem.eql(u8, str(d.get("status")) orelse "open", "closed")) .closed else .open;
+    i.anchor = if (d.get("anchor")) |v| (if (v == .object) v else null) else null;
+}
+
+/// `issues`, with the record values taken from `m` (cpull's merge) when given.
+pub fn issuesWith(a: Allocator, repo: *git.Repo, merged_maybe: ?Merged) ![]Issue {
     var by_id: std.StringArrayHashMapUnmanaged(Issue) = .empty;
     const C = struct { thread: []const u8, comment: Comment };
     var comment_ids: std.StringArrayHashMapUnmanaged(?C) = .empty;
@@ -157,12 +218,12 @@ pub fn issues(a: Allocator, repo: *git.Repo) ![]Issue {
                 .created = if (first) c.time else g.value_ptr.created,
                 .updated = c.time,
                 .id = id,
-                .title = str(d.get("title")) orelse "",
-                .description = str(d.get("description")) orelse "",
-                .labels = try splitLabels(a, str(d.get("labels")) orelse ""),
-                .status = if (std.mem.eql(u8, str(d.get("status")) orelse "open", "closed")) .closed else .open,
-                .anchor = if (d.get("anchor")) |v| (if (v == .object) v else null) else null,
+                .title = "",
+                .description = "",
+                .labels = &.{},
+                .status = .open,
             };
+            try setIssueData(a, g.value_ptr, d);
         } else if (std.mem.eql(u8, kind, "comment")) {
             const g = try comment_ids.getOrPut(a, id);
             const d = data orelse {
@@ -177,6 +238,29 @@ pub fn issues(a: Allocator, repo: *git.Repo) ![]Issue {
                 .parent_id = str(d.get("parent_id")) orelse "",
                 .body = str(d.get("body")) orelse "",
             } };
+        }
+    }
+
+    // cpull's merge decides the values, and which records survive
+    if (merged_maybe) |x| {
+        var i: usize = 0;
+        while (i < by_id.count()) {
+            const d = x.issues.get(by_id.keys()[i]) orelse {
+                by_id.orderedRemoveAt(i);
+                continue;
+            };
+            try setIssueData(a, &by_id.values()[i], d);
+            i += 1;
+        }
+        for (comment_ids.keys(), comment_ids.values()) |id, *v| {
+            const cm = &(v.* orelse continue);
+            const d = x.comments.get(id) orelse {
+                v.* = null;
+                continue;
+            };
+            cm.thread = str(d.get("thread_id")) orelse "";
+            cm.comment.parent_id = str(d.get("parent_id")) orelse "";
+            cm.comment.body = str(d.get("body")) orelse "";
         }
     }
 
@@ -428,14 +512,26 @@ pub const RepoIssues = struct { issues: []const Issue, name: []const u8, path: [
 /// Issues of the selected repos that have an events branch (open ones unless `all`).
 pub fn collect(a: Allocator, root: []const u8, names: []const []const u8, all: bool) ![]RepoIssues {
     var out: std.ArrayList(RepoIssues) = .empty;
+    // the repos with events, then one `cpull records` for all of them
+    var with_events: std.ArrayList(struct { name: []const u8, path: []const u8 }) = .empty;
     for (names) |name| {
         const p = try std.fs.path.join(a, &.{ root, name });
         const repo = git.Repo.open(a, p) catch continue;
         defer repo.close();
         _ = adopt(repo) catch false;
         if (tip(repo) == null) continue;
+        try with_events.append(a, .{ .name = name, .path = p });
+    }
+    const paths = try a.alloc([]const u8, with_events.items.len);
+    for (with_events.items, paths) |e, *p| p.* = e.path;
+    const ms = try merged(a, paths);
+    for (with_events.items, ms) |e, m| {
+        const name = e.name;
+        const p = e.path;
+        const repo = git.Repo.open(a, p) catch continue;
+        defer repo.close();
         var list: std.ArrayList(Issue) = .empty;
-        for (try issues(a, repo)) |i| if (all or i.status == .open) try list.append(a, i);
+        for (try issuesWith(a, repo, m)) |i| if (all or i.status == .open) try list.append(a, i);
         try out.append(a, .{ .issues = list.items, .name = name, .path = p });
     }
     return out.items;
