@@ -9,6 +9,7 @@ const git = @import("git");
 const cpull = @import("cpull");
 const mcp = @import("mcp.zig");
 const tools = @import("tools.zig");
+const ci = @import("ci.zig");
 const Args = @import("args.zig").Args;
 
 const Allocator = std.mem.Allocator;
@@ -107,11 +108,11 @@ pub const defs = &[_]mcp.Def{
     },
     .{
         .name = "cpull_merge",
-        .description = "Merge a cpull stack (`pull cpull merge`): every member patch into its target branch, all or nothing, then pin the merged commits in the pullfile with one signed commit (message: the stack title, or `message`). Refuses when repos have staged changes.",
+        .description = "Merge a cpull stack (`pull cpull merge`): every member patch into its target branch, all or nothing, then pin the merged commits in the pullfile with one signed commit (message: the stack title, or `message`). Refuses when repos have staged changes, and (with the pullfile's `cpull.require_ci`) until the stack's CI is green, unless `force`.",
         .schema =
-        \\{"$schema":"https://json-schema.org/draft/2020-12/schema","properties":{"message":{"description":"The pin commit's message (default: the stack title).","type":["string","null"]},"stack":{"description":"Stack id (a unique prefix will do).","type":"string"}},"required":["stack"],"type":"object"}
+        \\{"$schema":"https://json-schema.org/draft/2020-12/schema","properties":{"force":{"default":false,"description":"Merge even when the CI gate (cpull.require_ci) finds the CI not green.","type":"boolean"},"message":{"description":"The pin commit's message (default: the stack title).","type":["string","null"]},"stack":{"description":"Stack id (a unique prefix will do).","type":"string"}},"required":["stack"],"type":"object"}
         ,
-        .fields = &.{ .{ "stack", .string }, .{ "message", .opt_string } },
+        .fields = &.{ .{ "stack", .string }, .{ "message", .opt_string }, .{ "force", .boolean } },
         .run = merge,
     },
     // ------------------------------------------------ reports (what radar was)
@@ -308,6 +309,8 @@ fn stack(ctx: *const Ctx, a: Allocator, args: Args) !Result {
     const s, const infos = try cpull.stack.withPatches(a, ctx.root, pf, args.str("stack").?);
     var w: std.Io.Writer.Allocating = .init(a);
     try cpull.stack.writeStack(&w.writer, s, infos);
+    // its CI and the merge gate, from the workspace server when it runs
+    if (try ci.stackStatus(ctx, a, s.id)) |text| try w.writer.writeAll(text);
     return .{ .ok = try tools.truncate(a, w.written(), tools.MAX_OUTPUT) };
 }
 
@@ -323,6 +326,7 @@ fn merge(ctx: *const Ctx, a: Allocator, args: Args) !Result {
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(a, &.{ "cpull", "merge" });
     if (args.str("message")) |m| try argv.appendSlice(a, &.{ "--message", m });
+    if (args.flag("force")) try argv.append(a, "--force");
     try argv.append(a, args.str("stack").?);
     return runPull(ctx, a, argv.items);
 }

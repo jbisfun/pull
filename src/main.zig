@@ -313,7 +313,8 @@ fn cpullCmd(a: Allocator, root: []const u8, pfp: *core.Pullfile, cmd: cli.Cmd) !
             repo.close();
             if (!std.mem.eql(u8, s.status, "merged")) {
                 try pinCpullIdentity(a, root, pf, try identity(a, root, pf));
-                _ = try runCpull(a, root, pf, &.{ "cpull", "stack", "merge", "--workspace", root, s.id });
+                const argv: []const []const u8 = if (x.force) &.{ "cpull", "stack", "merge", "--force", "--workspace", root, s.id } else &.{ "cpull", "stack", "merge", "--workspace", root, s.id };
+                _ = try runCpull(a, root, pf, argv);
                 try o.print("stack {s}: merged {d} repo{s}\n", .{ s.id, s.members.len, if (s.members.len == 1) "" else "s" });
             }
             sys.outBytes(w.written());

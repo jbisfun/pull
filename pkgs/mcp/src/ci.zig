@@ -77,6 +77,24 @@ pub const defs = &[_]mcp.Def{
         .run = cancel,
     },
     .{
+        .name = "ci_patch",
+        .description = "cpull CI: build + test a cpull patch's source branch (the idl projects of its repo, with sibling repos at the workspace's commits) in a work tree of its own; returns the job ids. The patch page and `cpull_stack` show the result.",
+        .schema =
+        \\{"$schema":"https://json-schema.org/draft/2020-12/schema","properties":{"patch":{"description":"Patch id (a unique prefix will do).","type":"string"},"repo":{"description":"Repo name from the pullfile.","type":"string"}},"required":["repo","patch"],"type":"object"}
+        ,
+        .fields = &.{ .{ "repo", .string }, .{ "patch", .string } },
+        .run = patchCi,
+    },
+    .{
+        .name = "ci_stack",
+        .description = "cpull CI: build + test every member of a cpull stack, all members' branches checked out together; returns the job ids. With the pullfile's `cpull.require_ci`, a stack merges only once this is green at its branches' tips.",
+        .schema =
+        \\{"$schema":"https://json-schema.org/draft/2020-12/schema","properties":{"stack":{"description":"Stack id (a unique prefix will do).","type":"string"}},"required":["stack"],"type":"object"}
+        ,
+        .fields = &.{.{ "stack", .string }},
+        .run = stackCiTool,
+    },
+    .{
         .name = "ci_retry",
         .description = "cpull CI: queue the same job again; returns the new job id.",
         .schema = id_schema,
@@ -198,6 +216,65 @@ fn variant(a: Allocator, value: []const u8, names: []const []const u8) !?[]const
     try w.writer.print("failed to deserialize parameters: unknown variant `{s}`, expected one of ", .{value});
     for (names, 0..) |x, i| try w.writer.print("{s}`{s}`", .{ if (i > 0) ", " else "", x });
     return w.written();
+}
+
+fn queued(a: Allocator, v: std.json.Value) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(a);
+    try out.writer.print("{s}\n", .{s(v.object, "subject") orelse ""});
+    if (v.object.get("jobs")) |list| if (list == .array) for (list.array.items) |j| {
+        try out.writer.print("{s}{s}\n", .{ try summary(a, j), if (b(j.object, "deduplicated")) " (already queued)" else "" });
+    };
+    try out.writer.writeAll("Use `ci_wait` on the ids to block until they finish.");
+    return out.written();
+}
+
+fn patchCi(ctx: *const Ctx, a: Allocator, args: Args) !Result {
+    var c = switch (try connect(ctx, a)) {
+        .ok => |x| x,
+        .err => |m| return .{ .err = m },
+    };
+    const body = try std.json.Stringify.valueAlloc(a, .{ .repo = args.str("repo").?, .id = args.str("patch").?, .requested_by = "mcp" }, .{});
+    return switch (try c.send(.POST, "/ci/api/patch", body)) {
+        .ok => |v| .{ .ok = try queued(a, v) },
+        .err => |m| .{ .err = m },
+    };
+}
+
+fn stackCiTool(ctx: *const Ctx, a: Allocator, args: Args) !Result {
+    var c = switch (try connect(ctx, a)) {
+        .ok => |x| x,
+        .err => |m| return .{ .err = m },
+    };
+    const body = try std.json.Stringify.valueAlloc(a, .{ .id = args.str("stack").?, .requested_by = "mcp" }, .{});
+    return switch (try c.send(.POST, "/ci/api/stack", body)) {
+        .ok => |v| .{ .ok = try queued(a, v) },
+        .err => |m| .{ .err = m },
+    };
+}
+
+/// A stack's CI and merge gate as text lines for `cpull_stack`, or null when
+/// the workspace server isn't running.
+pub fn stackStatus(ctx: *const Ctx, a: Allocator, id: []const u8) !?[]const u8 {
+    var c = switch (try connect(ctx, a)) {
+        .ok => |x| x,
+        .err => return null,
+    };
+    const v = switch (try c.send(.GET, try std.fmt.allocPrint(a, "/ci/api/stack/{s}", .{id}), null)) {
+        .ok => |x| x,
+        .err => return null,
+    };
+    var out: std.Io.Writer.Allocating = .init(a);
+    const ci_v = v.object.get("ci");
+    if (ci_v != null and ci_v.? == .object) {
+        try out.writer.print("ci: {s}\n", .{s(ci_v.?.object, "label") orelse ""});
+        if (ci_v.?.object.get("jobs")) |list| if (list == .array) for (list.array.items) |j| {
+            try out.writer.print("  #{d} {s} {s}\n", .{ n(j.object, "id") orelse 0, s(j.object, "status") orelse "", s(j.object, "label") orelse "" });
+        };
+    } else try out.writer.writeAll("ci: not run yet (ci_stack queues it)\n");
+    if (v.object.get("gate")) |g| if (g == .object and b(g.object, "required")) {
+        try out.writer.print("merge gate (cpull.require_ci): {s}: {s}\n", .{ if (b(g.object, "ok")) "open" else "closed", s(g.object, "reason") orelse "" });
+    };
+    return out.written();
 }
 
 fn projects(ctx: *const Ctx, a: Allocator, _: Args) !Result {
