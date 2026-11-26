@@ -1142,7 +1142,7 @@ pub fn ObjectIterator(
             }
         }
 
-        fn isExcluded(self: *ObjectIterator(repo_kind, repo_opts), oid: *const [hash.hexLen(repo_opts.hash)]u8) !bool {
+        pub fn isExcluded(self: *ObjectIterator(repo_kind, repo_opts), oid: *const [hash.hexLen(repo_opts.hash)]u8) !bool {
             return switch (self.oid_excludes) {
                 .memory => |*memory| memory.contains(oid.*),
                 .temp => |temp| try temp.getSlot(try hash.hexToInt(repo_opts.hash, oid)) != null,

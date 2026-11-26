@@ -372,6 +372,12 @@ pub fn WireTransport(comptime repo_kind: rp.RepoKind, comptime repo_opts: rp.Rep
                 return error.InvalidDirection;
             }
 
+            // pull patch: enumerate the pack before the request starts, so the https
+            // POST never sits idle mid-body while objects are counted (servers time
+            // the request out and answer with a non-200 status).
+            var pack_writer_maybe = if (need_pack) try pack.PackWriter(repo_kind, repo_opts).init(allocator, state, io, git_push.includes.items, git_push.excludes.items, self.opts.progress_ctx) else null;
+            defer if (pack_writer_maybe) |*pack_writer| pack_writer.deinit();
+
             try self.connection.openStream(io, allocator, .receive_pack);
 
             const stream = &(self.connection.wire_stream orelse return error.StreamNotFound);
@@ -383,9 +389,7 @@ pub fn WireTransport(comptime repo_kind: rp.RepoKind, comptime repo_opts: rp.Rep
             try stream.write(allocator, buffer.items.ptr, buffer.items.len);
 
             if (need_pack) {
-                var pack_writer_maybe = try pack.PackWriter(repo_kind, repo_opts).init(allocator, state, io, git_push.includes.items, git_push.excludes.items, self.opts.progress_ctx);
                 if (pack_writer_maybe) |*pack_writer| {
-                    defer pack_writer.deinit();
 
                     if (repo_opts.ProgressCtx != void) {
                         if (self.opts.progress_ctx) |progress_ctx| {

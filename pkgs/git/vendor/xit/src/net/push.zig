@@ -103,6 +103,59 @@ pub fn Push(comptime repo_kind: rp.RepoKind, comptime repo_opts: rp.RepoOpts(rep
 
                 try self.excludes.append(allocator, head.oid);
             }
+
+            try self.narrowExcludes(state, io, allocator);
+        }
+
+        /// pull patch: excluding every remote head makes the pack writer walk the
+        /// whole tree of each (thousands of branches and tags on a big fork: many
+        /// minutes, while the https POST sits idle until the server gives up). Like
+        /// git's pack-objects (`mark_edge_parents_uninteresting`), walk the commits
+        /// first with the remote heads hidden, then keep only the edges: hidden
+        /// commits that are parents of a commit being sent, or that are themselves
+        /// being pushed. Only their trees can hold objects the new commits share.
+        fn narrowExcludes(
+            self: *Push(repo_kind, repo_opts),
+            state: rp.Repo(repo_kind, repo_opts).State(.read_only),
+            io: std.Io,
+            allocator: std.mem.Allocator,
+        ) !void {
+            if (self.excludes.items.len == 0 or self.includes.items.len == 0) return;
+            const Oid = [hash.hexLen(repo_opts.hash)]u8;
+
+            var walk = try obj.ObjectIterator(repo_kind, repo_opts).init(state, io, allocator, .{ .kind = .commit });
+            defer walk.deinit();
+            // commit-level only: marks each head and its parents, no tree walk
+            for (self.excludes.items) |*oid| try walk.exclude(oid);
+
+            var edges: std.AutoArrayHashMapUnmanaged(Oid, void) = .empty;
+            defer edges.deinit(allocator);
+            for (self.includes.items) |*oid| {
+                if (try walk.isExcluded(oid)) try edges.put(allocator, oid.*, {});
+                try walk.include(oid);
+            }
+
+            var sent: std.AutoHashMapUnmanaged(Oid, void) = .empty;
+            defer sent.deinit(allocator);
+            var parents: std.ArrayList(Oid) = .empty;
+            defer parents.deinit(allocator);
+            while (try walk.next(allocator)) |object| {
+                defer object.deinit();
+                try sent.put(allocator, object.oid, {});
+                if (object.content.commit.metadata.parent_oids) |ps| try parents.appendSlice(allocator, ps);
+            }
+            for (parents.items) |p| if (!sent.contains(p)) try edges.put(allocator, p, {});
+
+            self.excludes.clearRetainingCapacity();
+            for (edges.keys()) |oid| {
+                // a parent missing locally (shallow history) can't be walked
+                var object_reader = obj.ObjectReader(repo_kind, repo_opts).init(state, io, allocator, &oid) catch |err| switch (err) {
+                    error.ObjectNotFound => continue,
+                    else => |e| return e,
+                };
+                object_reader.deinit();
+                try self.excludes.append(allocator, oid);
+            }
         }
 
         fn initSpecs(
