@@ -8,6 +8,8 @@ const Value = std.json.Value;
 
 pub const Kind = enum {
     string,
+    /// `i64` (required).
+    int,
     opt_string,
     /// `Option<usize>`.
     opt_usize,
@@ -79,7 +81,7 @@ pub fn parse(a: Allocator, raw: ?[]const u8, fields: []const Field) !union(enum)
         if (!std.mem.eql(u8, f[0], k)) continue;
         if (try check(a, obj.get(k).?, f[1])) |msg| return .{ .err = try std.fmt.allocPrint(a, "failed to deserialize parameters: {s}", .{msg}) };
     };
-    for (fields) |f| if (f[1] == .string and !obj.contains(f[0]))
+    for (fields) |f| if ((f[1] == .string or f[1] == .int) and !obj.contains(f[0]))
         return .{ .err = try std.fmt.allocPrint(a, "failed to deserialize parameters: missing field `{s}`", .{f[0]}) };
     return .{ .ok = .{ .obj = obj } };
 }
@@ -92,6 +94,7 @@ fn check(a: Allocator, v: Value, kind: Kind) !?[]const u8 {
     return switch (kind) {
         .string, .opt_string => if (v == .string) null else try invalid(a, v, "a string"),
         .boolean => if (v == .bool) null else try invalid(a, v, "a boolean"),
+        .int => if (v == .integer) null else try invalid(a, v, "i64"),
         .opt_usize, .opt_u64 => {
             const name = if (kind == .opt_usize) "usize" else "u64";
             return switch (v) {

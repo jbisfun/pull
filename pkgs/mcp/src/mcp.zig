@@ -17,6 +17,7 @@ const tools = @import("tools.zig");
 pub const sessions = if (opts.sessions) @import("sessions.zig") else struct {};
 const launchd = if (opts.sessions) @import("launchd") else struct {};
 const cpull = if (opts.cpull) @import("cpull.zig") else struct {};
+const ci = @import("ci.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -53,7 +54,8 @@ pub const instructions = "pull workspace: several git repos under one root, mana
     "for an overview, then status/diff/log/grep/list_files/read_file across repos. " ++
     "`exec` runs a command to completion with the workspace env; sessions are stateful " ++
     "terminals (PTYs) that persist between calls and can be attached to by a human. " ++
-    "Commit with `pull commit -m MSG PATHS` via exec (subject lint applies)." ++
+    "Commit with `pull commit -m MSG PATHS` via exec (subject lint applies). " ++
+    "The idl projects' CI (cpull's /ci: build/test/lint jobs on a shared queue) has ci_* tools." ++
     (if (opts.cpull) " Repos with a `cpull/events` branch carry cpull issues; changes across repos landed together are cpull stacks: cpull_* tools." else "");
 
 /// A tool as registered: its spec (schema byte for byte as the Rust server's
@@ -95,7 +97,7 @@ pub fn defs() []const Def {
     const all = comptime blk: {
         @setEvalBranchQuota(100_000);
         const base = if (opts.sessions) tools.defs ++ sessions.defs.* else tools.defs;
-        var arr = if (opts.cpull) base ++ cpull.defs.* else base;
+        var arr = (if (opts.cpull) base ++ cpull.defs.* else base) ++ ci.defs.*;
         std.mem.sortUnstable(Def, &arr, {}, struct {
             fn lt(_: void, x: Def, y: Def) bool {
                 return std.mem.lessThan(u8, x.name, y.name);
@@ -136,5 +138,6 @@ test {
     _ = tools;
     if (opts.sessions) _ = sessions;
     if (opts.cpull) _ = cpull;
-    try std.testing.expect(defs().len == @as(usize, if (opts.sessions) 15 else 8) + if (opts.cpull) 16 else 0);
+    _ = ci;
+    try std.testing.expect(defs().len == @as(usize, if (opts.sessions) 15 else 8) + (if (opts.cpull) 16 else 0) + ci.defs.len);
 }
