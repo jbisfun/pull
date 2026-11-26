@@ -321,7 +321,8 @@ fn cpullCmd(a: Allocator, root: []const u8, pfp: *core.Pullfile, cmd: cli.Cmd) !
             // cpull authors the report from the repo's identity, which pull pins
             try pinCpullIdentity(a, root, pf, try identity(a, root, pf));
             const argv = try std.mem.concat(a, []const u8, &.{ &.{ "cpull", "report", "--workspace", root }, args });
-            const term = sys.runInherit(argv, .{ .cwd = root, .env = try cpullEnv(a, root, pf) }) catch |e|
+            // from the caller's dir, so a relative `migrate FILE` means what it says
+            const term = sys.runInherit(argv, .{ .env = try cpullEnv(a, root, pf) }) catch |e|
                 return sys.fail("running cpull: {s}", .{sys.describe(e)});
             std.process.exit(sys.exitCode(term));
         },
