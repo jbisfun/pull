@@ -112,7 +112,12 @@ already committed; `git rm --cached` those.
     cpull_issues / cpull_issue / cpull_new_issue / cpull_comment / cpull_close /
     cpull_reopen / cpull_sync        cpull issues (below)
     cpull_stacks / cpull_stack / cpull_patch /
-    cpull_merge                     cpull stacks (below)
+    cpull_merge                     cpull stacks (below); cpull_stack adds the stack's
+                                   CI from idlci when it runs
+
+The workspace's other tools serve their own MCP tools: `idlci mcp` the CI (`ci_*`),
+`radar mcp` line-anchored reports (`radar_report*`), `wiki mcp` the wiki. Register them
+in the pullfile `mcp_servers` section (below).
 
 Register it with an agent, e.g. Hermes:
 
@@ -125,7 +130,11 @@ editor/agent to register the whole set at once. A pullfile entry needs only a `c
 
     <key>mcp_servers</key>
     <dict>
+        <key>idlci</key>
+        <dict><key>args</key><array><string>mcp</string></array></dict>
         <key>radar</key>
+        <dict><key>args</key><array><string>mcp</string></array></dict>
+        <key>wiki</key>
         <dict><key>args</key><array><string>mcp</string></array></dict>
     </dict>
 
@@ -144,8 +153,13 @@ that branch too (to `origin/cpull/events`), `pull push` pushes it when it is ahe
     pull cpull sync [REPO...]                   fetch, fast-forward or merge, push
     pull cpull open [REPO]                      run `cpull` (TUI + local web UI) there,
                                                or over the whole workspace
-        [--web-listen ADDR] [--ci-jobs N] [--ci-watch] [--ci-watch-interval S]
-        [-- CPULL_ARGS...]                     no TUI / CI options / any other cpull flags
+        [--web-listen ADDR] [-- CPULL_ARGS...] no TUI / any other cpull flags
+    pull cpull report ARGS...                  runs `radar ARGS...` (line-anchored
+                                               reports, filed through cpull's API)
+
+The workspace server (`pull cpull open --web-listen ADDR`, the `cpull` job) also serves
+cpull's JSON API at `/api` for the workspace's other tools: idlci (CI, its own job and
+port), the wiki and radar. Its CI options moved to idlci (`idlci serve --jobs N --watch`).
 
 ISSUE is an id or a unique prefix of one. Events are written as cpull's local mode writes
 them, with pull's identity (and GPG signature), so `cpull` reads them; sync is cpull's own

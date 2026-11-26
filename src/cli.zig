@@ -63,9 +63,6 @@ pub const Cmd = union(enum) {
     cpull_open: struct {
         repo: ?[]const u8,
         web_listen: ?[]const u8 = null,
-        ci_jobs: ?[]const u8 = null,
-        ci_watch: bool = false,
-        ci_watch_interval: ?[]const u8 = null,
         /// After `--`: passed to cpull as they are (other workspace-server flags).
         extra: []const []const u8 = &.{},
     },
@@ -75,7 +72,7 @@ pub const Cmd = union(enum) {
     cpull_merge: struct { id: []const u8, message: ?[]const u8, force: bool = false },
     cpull_pin: struct { id: []const u8, message: ?[]const u8 },
     cpull_checkout: struct { id: []const u8, name: ?[]const u8 },
-    /// `cpull report ARGS...`, passed through to the cpull binary.
+    /// `cpull report ARGS...`, passed through to `radar ARGS...`.
     cpull_report: []const []const u8,
 };
 
@@ -136,7 +133,7 @@ const cpull_commands = [_]Sub{
     .{ .name = "merge", .about = "Merge every patch of a stack (all or none), then pin the merged commits" },
     .{ .name = "pin", .about = "Pin a merged stack's commits in the pullfile and commit it (as `pull commit` does)" },
     .{ .name = "checkout", .about = "A worktree workspace with each member's branch checked out" },
-    .{ .name = "report", .about = "Line-anchored issues (what radar was): file one on a line of code, list, show, close, reopen, migrate radar.db (runs `cpull report`)" },
+    .{ .name = "report", .about = "Line-anchored reports (cpull issues with an anchor): runs `radar ARGS...`, which files and tracks them through cpull's API" },
 };
 
 const repo_commands = [_]Sub{
@@ -287,13 +284,13 @@ fn leafHelp(a: Allocator, path: []const u8) !?[]const u8 {
         .{ "cpull comment", .{ .about = aboutOf(&cpull_commands, "comment"), .usage = "pull cpull comment <REPO> <ISSUE> <TEXT>", .args = &.{ .{ "<REPO>", "" }, .{ "<ISSUE>", "Issue id (a unique prefix will do)" }, .{ "<TEXT>", "" } }, .options = &.{help_flag} } },
         .{ "cpull close", .{ .about = aboutOf(&cpull_commands, "close"), .usage = "pull cpull close <REPO> <ISSUE>", .args = &.{ .{ "<REPO>", "" }, .{ "<ISSUE>", "Issue id (a unique prefix will do)" } }, .options = &.{help_flag} } },
         .{ "cpull reopen", .{ .about = aboutOf(&cpull_commands, "reopen"), .usage = "pull cpull reopen <REPO> <ISSUE>", .args = &.{ .{ "<REPO>", "" }, .{ "<ISSUE>", "Issue id (a unique prefix will do)" } }, .options = &.{help_flag} } },
-        .{ "cpull open", .{ .about = aboutOf(&cpull_commands, "open"), .usage = "pull cpull open [OPTIONS] [REPO] [-- CPULL_ARGS...]", .args = &.{ .{ "[REPO]", "Just this repo (default: the workspace)" }, .{ "[CPULL_ARGS]...", "Passed to cpull as they are (other workspace-server flags)" } }, .options = &.{ .{ "    --web-listen <ADDR>", "No TUI: serve only the web UI on ADDR (e.g. 127.0.0.1:8080) until killed, for a job" }, .{ "    --ci-jobs <N>", "Concurrent CI jobs (cpull default 1)" }, .{ "    --ci-watch", "Queue build + test when a CI project's HEAD moves" }, .{ "    --ci-watch-interval <SECS>", "Seconds between HEAD polls (cpull default 15)" }, help_flag } } },
+        .{ "cpull open", .{ .about = aboutOf(&cpull_commands, "open"), .usage = "pull cpull open [OPTIONS] [REPO] [-- CPULL_ARGS...]", .args = &.{ .{ "[REPO]", "Just this repo (default: the workspace)" }, .{ "[CPULL_ARGS]...", "Passed to cpull as they are (other workspace-server flags)" } }, .options = &.{ .{ "    --web-listen <ADDR>", "No TUI: serve only the web UI on ADDR (e.g. 127.0.0.1:8080) until killed, for a job" }, help_flag } } },
         .{ "cpull patch", .{ .about = aboutOf(&cpull_commands, "patch"), .usage = "pull cpull patch [OPTIONS]", .args = &.{}, .options = &.{ .{ "-t, --title <TITLE>", "Default: the branch name" }, .{ "-b, --body <BODY>", "Description (markdown)" }, .{ "-l, --labels <LABELS>", "Space-separated" }, .{ "    --branch <NAME>", "Repos with this branch (default: repos checked out on a branch other than their pullfile one)" }, help_flag } } },
         .{ "cpull stacks", .{ .about = aboutOf(&cpull_commands, "stacks"), .usage = "pull cpull stacks [OPTIONS]", .args = &.{}, .options = &.{ .{ "    --json", "Machine-readable: {root, stacks: [{author, created, description, id, labels, members, pins, status, title, updated}]}" }, help_flag } } },
         .{ "cpull stack", .{ .about = aboutOf(&cpull_commands, "stack"), .usage = "pull cpull stack [OPTIONS] <STACK>", .args = &.{.{ "<STACK>", "Stack id (a unique prefix will do)" }}, .options = &.{ .{ "    --json", "cpull's view: each member's patch and whether it merges" }, help_flag } } },
         .{ "cpull merge", .{ .about = aboutOf(&cpull_commands, "merge"), .usage = "pull cpull merge [OPTIONS] <STACK>", .args = &.{.{ "<STACK>", "Stack id (a unique prefix will do)" }}, .options = &.{ .{ "-m, --message <MESSAGE>", "The pin commit's message (default: the stack title)" }, .{ "    --force", "Merge even when the pullfile's cpull.require_ci gate finds the stack's CI not green" }, help_flag } } },
         .{ "cpull pin", .{ .about = aboutOf(&cpull_commands, "pin"), .usage = "pull cpull pin [OPTIONS] <STACK>", .args = &.{.{ "<STACK>", "Stack id (a unique prefix will do)" }}, .options = &.{ .{ "-m, --message <MESSAGE>", "The pin commit's message (default: the stack title)" }, help_flag } } },
-        .{ "cpull report", .{ .about = aboutOf(&cpull_commands, "report"), .usage = "pull cpull report <REPO> <FILE> <LINE> [-q QUOTE] [-n NOTE] | list [--all] [--json] | show|close|reopen <ID> | migrate <RADAR_JSON>", .args = &.{ .{ "<REPO>", "Pullfile repo, or . for the workspace's events repo" }, .{ "<FILE>", "Path relative to the repo" }, .{ "<LINE>", "1-based; its text is read from the file" }, .{ "<ID>", "Report (issue) id; a unique prefix will do" }, .{ "<RADAR_JSON>", "`radar list --all --json` output, - for stdin" } }, .options = &.{ .{ "-q, --quote <TEXT>", "The selected text, when narrower than the line" }, .{ "-n, --note <TEXT>", "What's wrong (the issue description)" }, .{ "    --title <TITLE>", "Default: the note's first line" }, .{ "    --labels <LABELS>", "Added to `report`" }, .{ "    --source <SOURCE>", "cli (default), wiki, ycode, mcp" }, .{ "    --all", "list: closed ones too" }, .{ "    --json", "Machine-readable: [{id, repo, file, line, line_text, quote, note, title, status, source, commit, created, author, url}]" }, help_flag } } },
+        .{ "cpull report", .{ .about = aboutOf(&cpull_commands, "report"), .usage = "pull cpull report [RADAR_ARGS]...", .args = &.{.{ "[RADAR_ARGS]...", "Passed to radar: REPO FILE LINE [-q QUOTE] [-n NOTE] | list [--all] [--json] | show|close|reopen <ID> | migrate <FILE> (see `radar --help`)" }}, .options = &.{help_flag} } },
         .{ "cpull checkout", .{ .about = aboutOf(&cpull_commands, "checkout"), .usage = "pull cpull checkout <STACK> [NAME]", .args = &.{ .{ "<STACK>", "Stack id (a unique prefix will do)" }, .{ "[NAME]", "Worktree name (default: stack-<id prefix>)" } }, .options = &.{help_flag} } },
     };
     for (leaves) |l| if (std.mem.eql(u8, l[0], path)) return try render(a, l[1]);
@@ -851,18 +848,12 @@ fn parseCpull(a: Allocator, sub: []const u8, iter: *ArgIter) !Cmd {
         const res = try parseSub(a, "cpull open", &comptime clap.parseParamsComptime(
             \\-h, --help
             \\--web-listen <str>
-            \\--ci-jobs <str>
-            \\--ci-watch
-            \\--ci-watch-interval <str>
             \\<str>...
             \\
         ), &head_iter);
         return .{ .cpull_open = .{
             .repo = try one(a, "cpull open", res.positionals[0]),
             .web_listen = res.args.@"web-listen",
-            .ci_jobs = res.args.@"ci-jobs",
-            .ci_watch = res.args.@"ci-watch" != 0,
-            .ci_watch_interval = res.args.@"ci-watch-interval",
             .extra = extra.items,
         } };
     }

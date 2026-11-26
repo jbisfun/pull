@@ -264,9 +264,6 @@ fn cpullCmd(a: Allocator, root: []const u8, pfp: *core.Pullfile, cmd: cli.Cmd) !
             try argv.append(a, "cpull");
             if (name_opt == null) try argv.appendSlice(a, &.{ "--workspace", root });
             if (x.web_listen) |addr| try argv.appendSlice(a, &.{ "--web-listen", addr });
-            if (x.ci_jobs) |n| try argv.appendSlice(a, &.{ "--ci-jobs", n });
-            if (x.ci_watch) try argv.append(a, "--ci-watch");
-            if (x.ci_watch_interval) |secs| try argv.appendSlice(a, &.{ "--ci-watch-interval", secs });
             try argv.appendSlice(a, x.extra);
             const term = sys.runInherit(argv.items, .{ .cwd = dir, .env = try cpullEnv(a, root, pf) }) catch |e|
                 return sys.fail("running cpull: {s}", .{sys.describe(e)});
@@ -323,12 +320,15 @@ fn cpullCmd(a: Allocator, root: []const u8, pfp: *core.Pullfile, cmd: cli.Cmd) !
         },
         .cpull_pin => |x| try pinStack(a, root, pfp, x.id, x.message),
         .cpull_report => |args| {
-            // cpull authors the report from the repo's identity, which pull pins
+            // reports are radar's now (github.com/jbisfun/radar): it files them
+            // through cpull's API, whose writes are pull's identity, pinned here
             try pinCpullIdentity(a, root, pf, try identity(a, root, pf));
-            const argv = try std.mem.concat(a, []const u8, &.{ &.{ "cpull", "report", "--workspace", root }, args });
+            const argv = try std.mem.concat(a, []const u8, &.{ &.{"radar"}, args });
             // from the caller's dir, so a relative `migrate FILE` means what it says
-            const term = sys.runInherit(argv, .{ .env = try cpullEnv(a, root, pf) }) catch |e|
-                return sys.fail("running cpull: {s}", .{sys.describe(e)});
+            const env = try cpullEnv(a, root, pf);
+            try env.put("PULL_ROOT", root);
+            const term = sys.runInherit(argv, .{ .env = env }) catch |e|
+                return sys.fail("running radar: {s} (install it from the workspace's radar repo)", .{sys.describe(e)});
             std.process.exit(sys.exitCode(term));
         },
         .cpull_checkout => |x| if (opts.worktree) {
