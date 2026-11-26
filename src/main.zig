@@ -264,6 +264,10 @@ fn cpullCmd(a: Allocator, root: []const u8, pfp: *core.Pullfile, cmd: cli.Cmd) !
             try argv.append(a, "cpull");
             if (name_opt == null) try argv.appendSlice(a, &.{ "--workspace", root });
             if (x.web_listen) |addr| try argv.appendSlice(a, &.{ "--web-listen", addr });
+            if (x.ci_jobs) |n| try argv.appendSlice(a, &.{ "--ci-jobs", n });
+            if (x.ci_watch) try argv.append(a, "--ci-watch");
+            if (x.ci_watch_interval) |secs| try argv.appendSlice(a, &.{ "--ci-watch-interval", secs });
+            try argv.appendSlice(a, x.extra);
             const term = sys.runInherit(argv.items, .{ .cwd = dir, .env = try cpullEnv(a, root, pf) }) catch |e|
                 return sys.fail("running cpull: {s}", .{sys.describe(e)});
             std.process.exit(sys.exitCode(term));

@@ -60,7 +60,15 @@ pub const Cmd = union(enum) {
     cpull_comment: struct { repo: []const u8, issue: []const u8, text: []const u8 },
     cpull_status: struct { repo: []const u8, issue: []const u8, close: bool },
     /// No repo: the whole workspace (cpull's workspace mode).
-    cpull_open: struct { repo: ?[]const u8, web_listen: ?[]const u8 = null },
+    cpull_open: struct {
+        repo: ?[]const u8,
+        web_listen: ?[]const u8 = null,
+        ci_jobs: ?[]const u8 = null,
+        ci_watch: bool = false,
+        ci_watch_interval: ?[]const u8 = null,
+        /// After `--`: passed to cpull as they are (other workspace-server flags).
+        extra: []const []const u8 = &.{},
+    },
     cpull_patch: struct { title: ?[]const u8, body: []const u8, labels: []const u8, branch: ?[]const u8 },
     cpull_stacks: struct { json: bool },
     cpull_stack: struct { id: []const u8, json: bool },
@@ -91,7 +99,7 @@ const top_commands = [_]Sub{
     .{ .name = "init", .about = "Create pullfile.plist and local.toml in the current directory" },
     .{ .name = "repo", .about = "Manage the repo list" },
     .{ .name = "sync", .about = "Clone missing repos, fetch, and fast-forward to pinned commits. Runs `pull` hooks" },
-    .{ .name = "update", .about = "Fetch and fast-forward every repo to its upstream branch, then re-pin. Runs `pull` hooks" },
+    .{ .name = "update", .about = "Fetch and fast-forward every repo to its upstream branch, then refresh existing pins (unpinned repos stay unpinned). Runs `pull` hooks" },
     .{ .name = "status", .about = "Show branch, pin and changes for every repo" },
     .{ .name = "unstage", .about = "Unstage paths (back to HEAD); each path is routed to its repo" },
     .{ .name = "add", .about = "Stage paths; each path is routed to the repo it lives in" },
@@ -279,7 +287,7 @@ fn leafHelp(a: Allocator, path: []const u8) !?[]const u8 {
         .{ "cpull comment", .{ .about = aboutOf(&cpull_commands, "comment"), .usage = "pull cpull comment <REPO> <ISSUE> <TEXT>", .args = &.{ .{ "<REPO>", "" }, .{ "<ISSUE>", "Issue id (a unique prefix will do)" }, .{ "<TEXT>", "" } }, .options = &.{help_flag} } },
         .{ "cpull close", .{ .about = aboutOf(&cpull_commands, "close"), .usage = "pull cpull close <REPO> <ISSUE>", .args = &.{ .{ "<REPO>", "" }, .{ "<ISSUE>", "Issue id (a unique prefix will do)" } }, .options = &.{help_flag} } },
         .{ "cpull reopen", .{ .about = aboutOf(&cpull_commands, "reopen"), .usage = "pull cpull reopen <REPO> <ISSUE>", .args = &.{ .{ "<REPO>", "" }, .{ "<ISSUE>", "Issue id (a unique prefix will do)" } }, .options = &.{help_flag} } },
-        .{ "cpull open", .{ .about = aboutOf(&cpull_commands, "open"), .usage = "pull cpull open [OPTIONS] [REPO]", .args = &.{.{ "[REPO]", "Just this repo (default: the workspace)" }}, .options = &.{ .{ "    --web-listen <ADDR>", "No TUI: serve only the web UI on ADDR (e.g. 127.0.0.1:8080) until killed, for a job" }, help_flag } } },
+        .{ "cpull open", .{ .about = aboutOf(&cpull_commands, "open"), .usage = "pull cpull open [OPTIONS] [REPO] [-- CPULL_ARGS...]", .args = &.{ .{ "[REPO]", "Just this repo (default: the workspace)" }, .{ "[CPULL_ARGS]...", "Passed to cpull as they are (other workspace-server flags)" } }, .options = &.{ .{ "    --web-listen <ADDR>", "No TUI: serve only the web UI on ADDR (e.g. 127.0.0.1:8080) until killed, for a job" }, .{ "    --ci-jobs <N>", "Concurrent CI jobs (cpull default 1)" }, .{ "    --ci-watch", "Queue build + test when a CI project's HEAD moves" }, .{ "    --ci-watch-interval <SECS>", "Seconds between HEAD polls (cpull default 15)" }, help_flag } } },
         .{ "cpull patch", .{ .about = aboutOf(&cpull_commands, "patch"), .usage = "pull cpull patch [OPTIONS]", .args = &.{}, .options = &.{ .{ "-t, --title <TITLE>", "Default: the branch name" }, .{ "-b, --body <BODY>", "Description (markdown)" }, .{ "-l, --labels <LABELS>", "Space-separated" }, .{ "    --branch <NAME>", "Repos with this branch (default: repos checked out on a branch other than their pullfile one)" }, help_flag } } },
         .{ "cpull stacks", .{ .about = aboutOf(&cpull_commands, "stacks"), .usage = "pull cpull stacks [OPTIONS]", .args = &.{}, .options = &.{ .{ "    --json", "Machine-readable: {root, stacks: [{author, created, description, id, labels, members, pins, status, title, updated}]}" }, help_flag } } },
         .{ "cpull stack", .{ .about = aboutOf(&cpull_commands, "stack"), .usage = "pull cpull stack [OPTIONS] <STACK>", .args = &.{.{ "<STACK>", "Stack id (a unique prefix will do)" }}, .options = &.{ .{ "    --json", "cpull's view: each member's patch and whether it merges" }, help_flag } } },
@@ -330,7 +338,7 @@ fn enabled(subs: []const Sub, name: []const u8) bool {
 
 const parsers = .{ .str = clap.parsers.string };
 
-fn parseSub(a: Allocator, comptime path: []const u8, comptime params: []const clap.Param(clap.Help), iter: *ArgIter) !clap.ResultEx(clap.Help, params, parsers) {
+fn parseSub(a: Allocator, comptime path: []const u8, comptime params: []const clap.Param(clap.Help), iter: anytype) !clap.ResultEx(clap.Help, params, parsers) {
     var d: clap.Diagnostic = .{};
     const res = clap.parseEx(clap.Help, params, parsers, iter, .{ .diagnostic = &d, .allocator = a }) catch |e| {
         var buf: [512]u8 = undefined;
@@ -829,13 +837,34 @@ fn parseCpull(a: Allocator, sub: []const u8, iter: *ArgIter) !Cmd {
         return .{ .cpull_new = .{ .repo = repo, .title = title, .body = res.args.body orelse "", .labels = res.args.labels orelse "" } };
     }
     if (eq(u8, sub, "open")) {
+        // everything after `--` goes to cpull untouched
+        var head: std.ArrayList([]const u8) = .empty;
+        var extra: std.ArrayList([]const u8) = .empty;
+        while (iter.next()) |arg| {
+            if (eq(u8, arg, "--")) {
+                while (iter.next()) |x| try extra.append(a, x);
+                break;
+            }
+            try head.append(a, arg);
+        }
+        var head_iter: clap.args.SliceIterator = .{ .args = head.items };
         const res = try parseSub(a, "cpull open", &comptime clap.parseParamsComptime(
             \\-h, --help
             \\--web-listen <str>
+            \\--ci-jobs <str>
+            \\--ci-watch
+            \\--ci-watch-interval <str>
             \\<str>...
             \\
-        ), iter);
-        return .{ .cpull_open = .{ .repo = try one(a, "cpull open", res.positionals[0]), .web_listen = res.args.@"web-listen" } };
+        ), &head_iter);
+        return .{ .cpull_open = .{
+            .repo = try one(a, "cpull open", res.positionals[0]),
+            .web_listen = res.args.@"web-listen",
+            .ci_jobs = res.args.@"ci-jobs",
+            .ci_watch = res.args.@"ci-watch" != 0,
+            .ci_watch_interval = res.args.@"ci-watch-interval",
+            .extra = extra.items,
+        } };
     }
     if (eq(u8, sub, "patch")) {
         const res = try parseSub(a, "cpull patch", &comptime clap.parseParamsComptime(
