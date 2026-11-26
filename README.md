@@ -175,7 +175,9 @@ The commands:
     pull cpull stacks [--json]     every stack, newest first
     pull cpull stack [--json] ID   members, their patches and pins (--json: cpull's view,
                                   including whether each member merges)
-    pull cpull merge [-m MSG] ID   merge every member (all or nothing), then pin
+    pull cpull merge [-m MSG] [--force] ID
+                                  merge every member (all or nothing), then pin;
+                                  --force skips the pullfile's cpull.require_ci gate
     pull cpull pin [-m MSG] ID     pin an already merged stack
     pull cpull checkout ID [NAME]  a worktree (.worktrees/NAME) with each member on its
                                   patch's branch
