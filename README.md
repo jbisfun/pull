@@ -23,9 +23,9 @@ feature requires another:
     pkgs/worktree  worktree       pull worktree
     pkgs/tool      tool           pullfile `tool`; pull tool
     pkgs/launchd   launchd        pullfile `jobs`; pull launchctl / pull session
-    pkgs/haxy      haxy           pull haxy (issues on haxy's `haxy/events` branch)
+    pkgs/cpull      cpull           pull cpull (issues on cpull's `cpull/events` branch)
     pkgs/mcp       mcp            pull mcp (session/job tools only with `launchd`,
-                                  haxy_* tools only with `haxy`)
+                                  cpull_* tools only with `cpull`)
 
 All features are on by default. Install to ~/.local/bin:
 
@@ -109,10 +109,10 @@ already committed; `git rm --cached` those.
     session_kill                   stateful terminals (the sessions below); a human can
                                    `pull session attach` to the same one
     job                            start/stop/restart/unload pullfile jobs
-    haxy_issues / haxy_issue / haxy_new_issue / haxy_comment / haxy_close /
-    haxy_reopen / haxy_sync        haxy issues (below)
-    haxy_stacks / haxy_stack / haxy_patch /
-    haxy_merge                     haxy stacks (below)
+    cpull_issues / cpull_issue / cpull_new_issue / cpull_comment / cpull_close /
+    cpull_reopen / cpull_sync        cpull issues (below)
+    cpull_stacks / cpull_stack / cpull_patch /
+    cpull_merge                     cpull stacks (below)
 
 Register it with an agent, e.g. Hermes:
 
@@ -131,57 +131,64 @@ editor/agent to register the whole set at once. A pullfile entry needs only a `c
 
 ycode-pull reads `pull mcp-servers` to register all of them in one go.
 
-## haxy issues
+## cpull issues
 
-[haxy](https://github.com/jbisfun/haxy) keeps a repo's issues as JSON event commits on a
-`haxy/events` branch. `pull sync` fetches that branch too (to `origin/haxy/events`), and:
+[cpull](https://github.com/jbisfun/cpull) (our fork of [haxy](https://github.com/xit-vcs/haxy))
+keeps a repo's issues as JSON event commits on a `cpull/events` branch. `pull sync` fetches
+that branch too (to `origin/cpull/events`), `pull push` pushes it when it is ahead, and:
 
-    pull haxy issues [REPO] [--all] [--json]   open (--all: every) issue per repo
-    pull haxy show REPO ISSUE                  description and comments
-    pull haxy new REPO -t TITLE [-b BODY] [-l LABELS]
-    pull haxy comment REPO ISSUE TEXT  |  close REPO ISSUE  |  reopen REPO ISSUE
-    pull haxy sync [REPO...]                   fetch, fast-forward or merge, push
-    pull haxy open [REPO]                      run `haxy` (TUI + local web UI) there,
+    pull cpull issues [REPO] [--all] [--json]   open (--all: every) issue per repo
+    pull cpull show REPO ISSUE                  description and comments
+    pull cpull new REPO -t TITLE [-b BODY] [-l LABELS]
+    pull cpull comment REPO ISSUE TEXT  |  close REPO ISSUE  |  reopen REPO ISSUE
+    pull cpull sync [REPO...]                   fetch, fast-forward or merge, push
+    pull cpull open [REPO]                      run `cpull` (TUI + local web UI) there,
                                                or over the whole workspace
 
-ISSUE is an id or a unique prefix of one. Events are written as haxy's local mode writes
-them, with pull's identity (and GPG signature), so `haxy` reads them; sync is haxy's own
+ISSUE is an id or a unique prefix of one. Events are written as cpull's local mode writes
+them, with pull's identity (and GPG signature), so `cpull` reads them; sync is cpull's own
 (an empty-tree merge commit when both sides moved). Listing replays the events (local
 branch, else origin's); concurrent edits of one issue resolve by causal order then time,
-where haxy would flag a field conflict.
+where cpull would flag a field conflict.
 
-## haxy stacks
+Before the rename the feature was `haxy` (`pull haxy ...` still works, hidden). Migration
+is automatic and one-time: a repo with a `haxy/events` branch (local or origin's) and no
+`cpull/events` gets a local `cpull/events` at the same commit on `pull sync`, `pull push`
+or any `pull cpull` command (`pull push` / `pull cpull sync` then push it; the old branch
+stays), and a pullfile `haxy` section is renamed to `cpull` the next time pull runs.
 
-A stack is one change across several repos: a haxy patch per repo, merged together and
+## cpull stacks
+
+A stack is one change across several repos: a cpull patch per repo, merged together and
 pinned in one pullfile commit. It is a `stack` event naming the member patches, kept in
 the workspace's events repo: the root repo when the root is a git repo, else the repo
-the pullfile `haxy` section names:
+the pullfile `cpull` section names:
 
-    <key>haxy</key>
+    <key>cpull</key>
     <dict><key>events</key><string>dotenv</string></dict>
 
 The commands:
 
-    pull haxy patch [-t TITLE] [-b BODY] [-l LABELS] [--branch NAME]
+    pull cpull patch [-t TITLE] [-b BODY] [-l LABELS] [--branch NAME]
                                   a patch per repo with unmerged work on a branch other
                                   than its pullfile one (or on NAME), and the stack
-    pull haxy stacks [--json]     every stack, newest first
-    pull haxy stack [--json] ID   members, their patches and pins (--json: haxy's view,
+    pull cpull stacks [--json]     every stack, newest first
+    pull cpull stack [--json] ID   members, their patches and pins (--json: cpull's view,
                                   including whether each member merges)
-    pull haxy merge [-m MSG] ID   merge every member (all or nothing), then pin
-    pull haxy pin [-m MSG] ID     pin an already merged stack
-    pull haxy checkout ID [NAME]  a worktree (.worktrees/NAME) with each member on its
+    pull cpull merge [-m MSG] ID   merge every member (all or nothing), then pin
+    pull cpull pin [-m MSG] ID     pin an already merged stack
+    pull cpull checkout ID [NAME]  a worktree (.worktrees/NAME) with each member on its
                                   patch's branch
 
-pull runs haxy to create and merge stacks (`haxy stack new|merge`), so `haxy` must be on
-`PATH`. haxy merges the members into their target branches without touching the work
+pull runs cpull to create and merge stacks (`cpull stack new|merge`), so `cpull` must be on
+`PATH`. cpull merges the members into their target branches without touching the work
 trees, and records the merged commits on the stack. pull then pins those commits and
 commits the pullfile the way `pull commit` does: precommit hook, signed commit, postcommit
 hook. The message is the stack title, or `pin stack <id>` if lint rejects the title.
 Pinning refuses when repos already have staged changes, so the commit holds only the pins.
-A merged stack can't change. `pull haxy open` (no repo) shows the workspace in haxy's
+A merged stack can't change. `pull cpull open` (no repo) shows the workspace in cpull's
 web UI, with stack pages under `/home/stacks` and a merge button that runs
-`pull haxy pin`. `pull haxy sync` also syncs the root repo's events when it holds the
+`pull cpull pin`. `pull cpull sync` also syncs the root repo's events when it holds the
 stacks.
 
 ## Jobs and sessions (launchd)

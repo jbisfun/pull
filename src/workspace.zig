@@ -13,7 +13,7 @@ const hooks_pkg = if (opts.hooks) @import("hooks") else struct {};
 const lint_pkg = if (opts.lint) @import("lint") else struct {};
 const ignore_pkg = if (opts.ignore) @import("ignore") else struct {};
 const tool_pkg = if (opts.tool) @import("tool") else struct {};
-const haxy_pkg = if (opts.haxy) @import("haxy") else struct {};
+const cpull_pkg = if (opts.cpull) @import("cpull") else struct {};
 
 /// Enabled build features (`pull --version`, `status --json`).
 pub const features = opts.features;
@@ -31,7 +31,8 @@ const SECTIONS = [_]struct { []const u8, []const u8 }{
     .{ "ignore", "ignore" },
     .{ "jobs", "launchd" },
     .{ "tool", "tool" },
-    .{ "haxy", "haxy" },
+    .{ "cpull", "cpull" },
+    .{ "haxy", "cpull" },
 };
 
 /// Say so when the pullfile configures something this build can't do (the section
@@ -84,9 +85,32 @@ pub fn workspaceEnv(a: Allocator, root: []const u8) []const EnvVar {
     return env(a, root, pf) catch &.{};
 }
 
-/// Refspecs `pull sync` fetches besides the branches: haxy's events branch with
-/// the `haxy` feature (xit's `refs/heads/*` glob doesn't reach `haxy/events`).
-pub const fetch_specs: []const []const u8 = if (opts.haxy) &.{haxy_pkg.FETCH_SPEC} else &.{};
+/// Refspecs `pull sync` fetches besides the branches: cpull's events branch with
+/// the `cpull` feature (xit's `refs/heads/*` glob doesn't reach `cpull/events`).
+pub const fetch_specs: []const []const u8 = if (opts.cpull) cpull_pkg.FETCH_SPECS else &.{};
+
+/// Branches `pull push` pushes besides each repo's own when they are ahead of
+/// origin's: the events branch with the `cpull` feature.
+pub const push_branches: []const []const u8 = if (opts.cpull) &.{cpull_pkg.BRANCH} else &.{};
+
+/// One-time migrations from haxy (the `cpull` feature's name before): the pullfile
+/// `haxy` section becomes `cpull` (saved), and repos whose events are still on
+/// `haxy/events` get a `cpull/events` at the same commit. No-op without `cpull`.
+pub fn migrateHaxy(root: []const u8, pf: *core.Pullfile) !void {
+    if (!opts.cpull) return;
+    if (cpull_pkg.migrateSection(pf)) {
+        try pf.save(root);
+        sys.err("pull: renamed the pullfile `haxy` section to `cpull`\n", .{});
+    }
+}
+
+/// `cpull`'s adopt of `haxy/events` in every repo and the root (no-op without it).
+pub fn adoptEvents(a: Allocator, root: []const u8, pf: core.Pullfile) !void {
+    if (!opts.cpull) return;
+    var w: std.Io.Writer.Allocating = .init(a);
+    try cpull_pkg.adoptAll(a, root, try std.mem.concat(a, []const u8, &.{ &.{cpull_pkg.stack.ROOT}, try pf.repoNames() }), &w.writer);
+    sys.outBytes(w.written());
+}
 
 pub const Hook = enum { precommit, postcommit, pull };
 

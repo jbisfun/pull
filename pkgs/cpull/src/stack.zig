@@ -1,20 +1,20 @@
-//! Stacks: a change across the workspace's repos, landed together. haxy keeps one
+//! Stacks: a change across the workspace's repos, landed together. cpull keeps one
 //! as a `stack` event in the workspace's events repo (the root repo when the root
-//! is a git repo, else the pullfile `haxy` section's `events` repo) naming one
-//! ordinary haxy patch per member repo:
+//! is a git repo, else the pullfile `cpull` section's `events` repo) naming one
+//! ordinary cpull patch per member repo:
 //!
 //!   {"id":..,"kind":"stack","data":{"title":..,"description":..,"labels":..,
 //!    "members":"<repo> <patch id>\n..","status":{"open":{}}}}
 //!
 //! and, once merged, `"status":{"merged":{"pins":"<repo> <oid>\n.."}}`. Stacks are
 //! read here by replaying events, like issues; creating and merging them is
-//! haxy's (`haxy stack new|merge|show`), which pull runs, since a patch carries
-//! revision snapshots only haxy computes. Recording the pins is pull's: it owns
+//! cpull's (`cpull stack new|merge|show`), which pull runs, since a patch carries
+//! revision snapshots only cpull computes. Recording the pins is pull's: it owns
 //! the pullfile and its signed commits.
 const std = @import("std");
 const core = @import("core");
 const git = @import("git");
-const haxy = @import("haxy.zig");
+const cpull = @import("cpull.zig");
 const sys = core.sys;
 const Allocator = std.mem.Allocator;
 
@@ -44,10 +44,10 @@ pub const EventsRepo = struct { name: []const u8, path: []const u8 };
 pub const ROOT = "(root)";
 
 pub fn eventsRepo(a: Allocator, root: []const u8, pf: core.Pullfile) !?EventsRepo {
-    if (pf.sectionValue("haxy")) |v| if (v == .dict) if (v.dict.get("events")) |e| if (e == .string) {
+    if (cpull.section(pf)) |v| if (v == .dict) if (v.dict.get("events")) |e| if (e == .string) {
         for (pf.repos.items) |r| {
             if (std.mem.eql(u8, r.name, e.string)) break;
-        } else return sys.fail("pullfile haxy.events: no repo `{s}`", .{e.string});
+        } else return sys.fail("pullfile cpull.events: no repo `{s}`", .{e.string});
         return .{ .name = e.string, .path = try std.fs.path.join(a, &.{ root, e.string }) };
     };
     if (git.rootRepo(a, root)) |r| {
@@ -59,15 +59,16 @@ pub fn eventsRepo(a: Allocator, root: []const u8, pf: core.Pullfile) !?EventsRep
 
 pub fn openEvents(a: Allocator, root: []const u8, pf: core.Pullfile) !struct { EventsRepo, *git.Repo } {
     const ev = (try eventsRepo(a, root, pf)) orelse
-        return sys.fail("no events repo: make the workspace root a git repo, or name one in the pullfile `haxy` section's `events`", .{});
+        return sys.fail("no events repo: make the workspace root a git repo, or name one in the pullfile `cpull` section's `events`", .{});
     const repo = git.Repo.open(a, ev.path) catch return sys.fail("{s}: not cloned (run `pull sync`)", .{ev.name});
+    _ = try cpull.adopt(repo);
     return .{ ev, repo };
 }
 
 /// Every stack (removed ones dropped), newest first.
 pub fn stacks(a: Allocator, repo: *git.Repo) ![]Stack {
     var by_id: std.StringArrayHashMapUnmanaged(Stack) = .empty;
-    for (try haxy.events(a, repo)) |e| {
+    for (try cpull.events(a, repo)) |e| {
         if (!std.mem.eql(u8, e.kind, "stack")) continue;
         const d = e.data orelse {
             _ = by_id.orderedRemove(e.id);
@@ -82,12 +83,12 @@ pub fn stacks(a: Allocator, repo: *git.Repo) ![]Stack {
             .created = if (first) e.commit.time else g.value_ptr.created,
             .updated = e.commit.time,
             .id = e.id,
-            .title = haxy.str(d.get("title")) orelse "",
-            .description = haxy.str(d.get("description")) orelse "",
-            .labels = try haxy.splitLabels(a, haxy.str(d.get("labels")) orelse ""),
-            .members = try parseMembers(a, haxy.str(d.get("members")) orelse ""),
+            .title = cpull.str(d.get("title")) orelse "",
+            .description = cpull.str(d.get("description")) orelse "",
+            .labels = try cpull.splitLabels(a, cpull.str(d.get("labels")) orelse ""),
+            .members = try parseMembers(a, cpull.str(d.get("members")) orelse ""),
             .status = status_name,
-            .pins = if (std.mem.eql(u8, status_name, "merged")) try parsePins(a, haxy.str(status.?.object.get("merged").?.object.get("pins")) orelse "") else &.{},
+            .pins = if (std.mem.eql(u8, status_name, "merged")) try parsePins(a, cpull.str(status.?.object.get("merged").?.object.get("pins")) orelse "") else &.{},
         };
     }
     const out = try a.dupe(Stack, by_id.values());
@@ -144,16 +145,16 @@ pub const PatchInfo = struct { source_branch: ?[]const u8, status: []const u8, t
 
 pub fn patchInfo(a: Allocator, repo: *git.Repo, patch_id: []const u8) !?PatchInfo {
     var info: ?PatchInfo = null;
-    for (try haxy.events(a, repo)) |e| {
+    for (try cpull.events(a, repo)) |e| {
         if (!std.mem.eql(u8, e.kind, "patch") or !std.mem.eql(u8, e.id, patch_id)) continue;
         const d = e.data orelse {
             info = null;
             continue;
         };
         info = .{
-            .title = haxy.str(d.get("title")) orelse "",
-            .source_branch = haxy.str(d.get("source_branch")),
-            .target_branch = haxy.str(d.get("target_branch")) orelse "",
+            .title = cpull.str(d.get("title")) orelse "",
+            .source_branch = cpull.str(d.get("source_branch")),
+            .target_branch = cpull.str(d.get("target_branch")) orelse "",
             .status = statusName(d.get("status")),
         };
     }
@@ -200,10 +201,10 @@ pub fn candidates(a: Allocator, root: []const u8, pf: core.Pullfile, branch: ?[]
     return out.items;
 }
 
-/// The haxy commands' arguments for `haxy stack new`.
+/// The cpull commands' arguments for `cpull stack new`.
 pub fn newArgs(a: Allocator, root: []const u8, title: []const u8, body: []const u8, labels: []const u8, members: []const Candidate) ![]const []const u8 {
     var argv: std.ArrayList([]const u8) = .empty;
-    try argv.appendSlice(a, &.{ "haxy", "stack", "new", "--workspace", root, "--title", title });
+    try argv.appendSlice(a, &.{ "cpull", "stack", "new", "--workspace", root, "--title", title });
     if (body.len > 0) try argv.appendSlice(a, &.{ "--description", body });
     if (labels.len > 0) try argv.appendSlice(a, &.{ "--labels", labels });
     for (members) |m| try argv.append(a, try std.fmt.allocPrint(a, "{s}:{s}", .{ m.repo, m.branch }));

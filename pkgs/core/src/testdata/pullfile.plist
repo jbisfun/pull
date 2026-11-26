@@ -564,9 +564,9 @@
 		</dict>
 		<dict>
 			<key>name</key>
-			<string>haxy</string>
+			<string>cpull</string>
 			<key>upstream</key>
-			<string>https://github.com/jbisfun/haxy</string>
+			<string>https://github.com/jbisfun/cpull</string>
 			<key>branch</key>
 			<string>master</string>
 		</dict>

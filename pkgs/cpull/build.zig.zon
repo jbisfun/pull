@@ -1,7 +1,7 @@
 .{
-    .name = .pull_haxy,
+    .name = .pull_cpull,
     .version = "0.1.0",
-    .fingerprint = 0x2c1bdb8840e00d5,
+    .fingerprint = 0xf3a64c5121afd11c,
     .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .core = .{ .path = "../core" },

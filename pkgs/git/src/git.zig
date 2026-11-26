@@ -213,10 +213,13 @@ pub fn commit(a: Allocator, root: []const u8, pf: *core.Pullfile, targets: []con
 }
 
 /// Push every repo whose branch is ahead of origin, then the root repo (if any).
-pub fn push(a: Allocator, root: []const u8, pf: core.Pullfile) !void {
+/// `extra`: other local branches pushed where they exist and origin's copy is
+/// missing or behind (a diverged one is left for its own sync).
+pub fn push(a: Allocator, root: []const u8, pf: core.Pullfile, extra: []const []const u8) !void {
     for (pf.repos.items) |r| {
         const repo = try open(a, root, r.name);
         defer repo.close();
+        try pushExtra(a, repo, r.name, extra);
         const head = repo.headOid() orelse continue;
         if (repo.remoteOid(r.branch)) |o| if (std.mem.eql(u8, &head, &o)) continue;
         sys.out("{s}: pushing {s}\n", .{ r.name, r.branch });
@@ -229,6 +232,22 @@ pub fn push(a: Allocator, root: []const u8, pf: core.Pullfile) !void {
             sys.out("(root): pushing {s}\n", .{b});
             repo.push(b) catch |e| return sys.context(e, "(root)", .{});
         };
+        if (repo.hasRemote("origin")) try pushExtra(a, repo, "(root)", extra);
+    }
+}
+
+fn pushExtra(a: Allocator, repo: *Repo, name: []const u8, extra: []const []const u8) !void {
+    if (extra.len == 0 or !repo.hasRemote("origin")) return;
+    for (extra) |b| {
+        const local = repo.refOid(try std.fmt.allocPrint(a, "refs/heads/{s}", .{b})) orelse continue;
+        const remote_ref = try std.fmt.allocPrint(a, "refs/remotes/origin/{s}", .{b});
+        if (repo.refOid(remote_ref)) |o| {
+            if (std.mem.eql(u8, &local, &o)) continue;
+            if (!try repo.descendantOf(local, o)) continue;
+        }
+        sys.out("{s}: pushing {s}\n", .{ name, b });
+        repo.push(b) catch |e| return sys.context(e, "{s}", .{name});
+        try repo.writeRef(remote_ref, local);
     }
 }
 

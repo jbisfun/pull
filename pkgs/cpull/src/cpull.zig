@@ -1,14 +1,14 @@
-//! haxy issues in a pull workspace. haxy (a local-first git forge) keeps a project's
-//! issues, comments, patches and discussions as events on the `haxy/events` branch:
+//! cpull issues in a pull workspace. cpull (a local-first git forge) keeps a project's
+//! issues, comments, patches and discussions as events on the `cpull/events` branch:
 //! one commit per event with an empty tree, the event as JSON in the message
 //! (`{"id":..,"kind":"issue","data":{..}}`; `data: null` removes the record), the
 //! author line naming who made it. Merges of two event histories are commits with
-//! two parents and no event. See haxy's docs/event.md and docs/local.md.
+//! two parents and no event. See cpull's docs/event.md and docs/local.md.
 //!
 //! Issues are read by replaying the events (latest event per id wins, in causal
 //! order: a commit's generation, then commit time) from the local branch, else
-//! origin's. New events are written exactly as haxy's local mode writes them, so
-//! `haxy` itself consumes them. Sync is haxy's own: fetch origin's branch,
+//! origin's. New events are written exactly as cpull's local mode writes them, so
+//! `cpull` itself consumes them. Sync is cpull's own: fetch origin's branch,
 //! fast-forward or make an empty-tree merge commit, push.
 const std = @import("std");
 const core = @import("core");
@@ -19,14 +19,25 @@ const Oid = git.Oid;
 
 pub const stack = @import("stack.zig");
 
-pub const BRANCH = "haxy/events";
+pub const BRANCH = "cpull/events";
 pub const LOCAL = "refs/heads/" ++ BRANCH;
 pub const REMOTE = "refs/remotes/origin/" ++ BRANCH;
 pub const FETCH_SPEC = "+" ++ LOCAL ++ ":" ++ REMOTE;
 const PUSH_SPEC = LOCAL ++ ":" ++ LOCAL;
-/// haxy's `evt.max_event_size`.
+/// The events branch before the fork was renamed from haxy to cpull: fetched too,
+/// so `adopt` can take it over; never written.
+pub const LEGACY_BRANCH = "haxy/events";
+const LEGACY_LOCAL = "refs/heads/" ++ LEGACY_BRANCH;
+const LEGACY_REMOTE = "refs/remotes/origin/" ++ LEGACY_BRANCH;
+pub const LEGACY_FETCH_SPEC = "+" ++ LEGACY_LOCAL ++ ":" ++ LEGACY_REMOTE;
+/// Everything `pull sync` and `pull cpull sync` fetch for events.
+pub const FETCH_SPECS: []const []const u8 = &.{ FETCH_SPEC, LEGACY_FETCH_SPEC };
+/// The pullfile section (`events`), and its name before the rename.
+pub const SECTION = "cpull";
+pub const LEGACY_SECTION = "haxy";
+/// cpull's `evt.max_event_size`.
 const MAX_EVENT = 100 * 1024;
-/// haxy's `Issue.label_max_len`.
+/// cpull's `Issue.label_max_len`.
 const LABEL_MAX = 64;
 
 pub const Status = enum { open, closed };
@@ -59,6 +70,43 @@ pub const Issue = struct {
 /// The events tip pull reads: the local branch, else origin's.
 pub fn tip(repo: *git.Repo) ?Oid {
     return repo.refOid(LOCAL) orelse repo.refOid(REMOTE);
+}
+
+/// One-time migration from haxy: a repo with no cpull/events (local or origin's)
+/// but a haxy/events one gets a local cpull/events at the same commit (the local
+/// haxy branch first, else origin's), which the next sync or `pull push` pushes.
+/// The old branch is left alone. Returns whether it adopted one.
+pub fn adopt(repo: *git.Repo) !bool {
+    if (tip(repo) != null) return false;
+    const old = repo.refOid(LEGACY_LOCAL) orelse repo.refOid(LEGACY_REMOTE) orelse return false;
+    try repo.writeRef(LOCAL, old);
+    return true;
+}
+
+/// `adopt` in every named repo that is cloned (`stack.ROOT` = the root repo).
+pub fn adoptAll(a: Allocator, root: []const u8, names: []const []const u8, w: ?*std.Io.Writer) !void {
+    for (names) |name| {
+        const p = if (std.mem.eql(u8, name, stack.ROOT)) root else try std.fs.path.join(a, &.{ root, name });
+        const repo = git.Repo.open(a, p) catch continue;
+        defer repo.close();
+        if (adopt(repo) catch false) if (w) |o| try o.print("{s}: {s} -> {s}\n", .{ name, LEGACY_BRANCH, BRANCH });
+    }
+}
+
+/// The pullfile `cpull` section, else the `haxy` one it was called before.
+pub fn section(pf: core.Pullfile) ?core.plist.Value {
+    return pf.sectionValue(SECTION) orelse pf.sectionValue(LEGACY_SECTION);
+}
+
+/// Rename a pullfile's `haxy` section to `cpull` in place (unless it already
+/// has one). Returns whether it changed; the caller saves.
+pub fn migrateSection(pf: *core.Pullfile) bool {
+    if (pf.sectionValue(SECTION) != null) return false;
+    for (pf.sections.entries.items) |*e| if (std.mem.eql(u8, e.key, LEGACY_SECTION)) {
+        e.key = SECTION;
+        return true;
+    };
+    return false;
 }
 
 /// One event: `data` null removes the record `id` names.
@@ -169,7 +217,7 @@ pub fn splitLabels(a: Allocator, labels: []const u8) ![]const []const u8 {
 const Node = struct { oid: Oid, gen: u64, commit: git.Repo.Commit };
 
 /// Every commit reachable from `head`, parents before children: by generation
-/// (haxy's event order: one more than the highest parent's), then commit time.
+/// (cpull's event order: one more than the highest parent's), then commit time.
 fn replayOrder(a: Allocator, repo: *git.Repo, head: Oid) ![]git.Repo.Commit {
     var commits: std.AutoArrayHashMapUnmanaged(Oid, Node) = .empty;
     var todo: std.ArrayList(Oid) = .empty;
@@ -218,7 +266,7 @@ fn replayOrder(a: Allocator, repo: *git.Repo, head: Oid) ![]git.Repo.Commit {
 
 // ---------------------------------------------------------------- writing
 
-/// A new event id: 16 random bytes in lowercase hex (haxy's `event_id_size`).
+/// A new event id: 16 random bytes in lowercase hex (cpull's `event_id_size`).
 fn newId() [32]u8 {
     var bytes: [16]u8 = undefined;
     sys.io.random(&bytes);
@@ -226,17 +274,17 @@ fn newId() [32]u8 {
 }
 
 /// Commit one event onto the local branch (continuing from origin's when there is
-/// no local one yet, as haxy does), with a fresh empty tree.
+/// no local one yet, as cpull does), with a fresh empty tree.
 fn commitEvent(a: Allocator, repo: *git.Repo, id: core.Identity, event: anytype) !Oid {
     const json = try std.json.Stringify.valueAlloc(a, event, .{});
-    if (json.len > MAX_EVENT) return sys.fail("event too large ({d} bytes, haxy allows {d})", .{ json.len, MAX_EVENT });
+    if (json.len > MAX_EVENT) return sys.fail("event too large ({d} bytes, cpull allows {d})", .{ json.len, MAX_EVENT });
     const parent = tip(repo);
     const oid = try repo.commitObject(id, try repo.emptyTree(), if (parent) |p| &.{p} else &.{}, json, sys.now());
     try repo.writeRef(LOCAL, oid);
     return oid;
 }
 
-/// haxy's Issue event fields, in its order.
+/// cpull's Issue event fields, in its order.
 const IssueData = struct { title: []const u8, description: []const u8, labels: []const u8, status: Status };
 const CommentData = struct { thread_id: []const u8, parent_id: []const u8, body: []const u8 };
 
@@ -259,7 +307,7 @@ pub fn create(a: Allocator, repo: *git.Repo, id: core.Identity, title: []const u
     return issue_id;
 }
 
-/// Close or reopen an issue (the whole issue re-emitted, as haxy does). Returns
+/// Close or reopen an issue (the whole issue re-emitted, as cpull does). Returns
 /// the issue, or null if it already had that status.
 pub fn setStatus(a: Allocator, repo: *git.Repo, id: core.Identity, issue_ref: []const u8, status: Status) !?Issue {
     const issue = try find(try issues(a, repo), issue_ref);
@@ -298,9 +346,10 @@ pub const Synced = union(enum) {
     merged: Oid,
 };
 
-/// haxy's sync for one repo, or null when neither side has the events branch.
+/// cpull's sync for one repo, or null when neither side has the events branch.
 pub fn sync(repo: *git.Repo, id: core.Identity) !?Synced {
-    if (repo.hasRemote("origin")) try repo.fetchSpecs(&.{FETCH_SPEC});
+    if (repo.hasRemote("origin")) try repo.fetchSpecs(FETCH_SPECS);
+    _ = try adopt(repo);
     const remote = repo.refOid(REMOTE);
     const local = repo.refOid(LOCAL) orelse {
         const r = remote orelse return null;
@@ -376,6 +425,7 @@ pub fn collect(a: Allocator, root: []const u8, names: []const []const u8, all: b
         const p = try std.fs.path.join(a, &.{ root, name });
         const repo = git.Repo.open(a, p) catch continue;
         defer repo.close();
+        _ = adopt(repo) catch false;
         if (tip(repo) == null) continue;
         var list: std.ArrayList(Issue) = .empty;
         for (try issues(a, repo)) |i| if (all or i.status == .open) try list.append(a, i);
@@ -384,7 +434,7 @@ pub fn collect(a: Allocator, root: []const u8, names: []const []const u8, all: b
     return out.items;
 }
 
-/// `pull haxy issues`: per repo, one line per issue.
+/// `pull cpull issues`: per repo, one line per issue.
 pub fn writeList(w: *std.Io.Writer, repos: []const RepoIssues) !void {
     for (repos) |r| {
         try w.print("{s}: {d} issue{s}\n", .{ r.name, r.issues.len, if (r.issues.len == 1) "" else "s" });
@@ -436,7 +486,7 @@ pub fn writeJson(w: *std.Io.Writer, root: []const u8, repos: []const RepoIssues)
     try w.writeByte('\n');
 }
 
-test "event json is haxy's" {
+test "event json is cpull's" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -446,6 +496,31 @@ test "event json is haxy's" {
     try std.testing.expectEqual(@as(usize, 32), newId().len);
     try std.testing.expectEqual(@as(usize, 2), (try splitLabels(a, "a, b")).len);
     try std.testing.expectEqualStrings("2026-11-25 20:38 UTC", try std.fmt.allocPrint(a, "{f}", .{Date{ .secs = 1795639091 }}));
+}
+
+test "the pullfile haxy section is read and renamed to cpull" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var pf = try core.Pullfile.parse(arena.allocator(),
+        \\<?xml version="1.0" encoding="UTF-8"?>
+        \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        \\<plist version="1.0">
+        \\<dict>
+        \\    <key>haxy</key>
+        \\    <dict>
+        \\        <key>events</key>
+        \\        <string>dotenv</string>
+        \\    </dict>
+        \\    <key>repos</key>
+        \\    <array/>
+        \\</dict>
+        \\</plist>
+    );
+    try std.testing.expect(section(pf) != null);
+    try std.testing.expect(migrateSection(&pf));
+    try std.testing.expect(pf.sectionValue(SECTION) != null);
+    try std.testing.expect(pf.sectionValue(LEGACY_SECTION) == null);
+    try std.testing.expect(!migrateSection(&pf));
 }
 
 test {

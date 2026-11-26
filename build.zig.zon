@@ -17,7 +17,7 @@
         .worktree = .{ .path = "pkgs/worktree" },
         .tool = .{ .path = "pkgs/tool" },
         .launchd = .{ .path = "pkgs/launchd" },
-        .haxy = .{ .path = "pkgs/haxy" },
+        .cpull = .{ .path = "pkgs/cpull" },
         .mcp = .{ .path = "pkgs/mcp" },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src", "pkgs" },
