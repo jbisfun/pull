@@ -240,9 +240,10 @@ fn haxyCmd(a: Allocator, root: []const u8, pfp: *core.Pullfile, cmd: cli.Cmd) !v
                 try o.print("{s}: {s} {s}\n", .{ x.repo, verb, i.id });
             } else try o.print("{s}: {s} is already {s}\n", .{ x.repo, x.issue, @tagName(status) });
         },
-        .haxy_open => |name_opt| {
+        .haxy_open => |x| {
             // haxy's local mode authors events from the repo's user.name/user.email
             // config, so pin those to pull's identity instead of the global git one.
+            const name_opt = x.repo;
             const id = try identity(a, root, pf);
             const dir = if (name_opt) |name| blk: {
                 const repo = try haxyRepo(a, root, pf, name);
@@ -254,8 +255,12 @@ fn haxyCmd(a: Allocator, root: []const u8, pfp: *core.Pullfile, cmd: cli.Cmd) !v
                 try pinHaxyIdentity(a, root, pf, id);
                 break :blk root;
             };
-            const argv: []const []const u8 = if (name_opt == null) &.{ "haxy", "--workspace", root } else &.{"haxy"};
-            const term = sys.runInherit(argv, .{ .cwd = dir, .env = try haxyEnv(a, root, pf) }) catch |e|
+            // --web-listen: no TUI, just the account-less web UI, as a job
+            var argv: std.ArrayList([]const u8) = .empty;
+            try argv.append(a, "haxy");
+            if (name_opt == null) try argv.appendSlice(a, &.{ "--workspace", root });
+            if (x.web_listen) |addr| try argv.appendSlice(a, &.{ "--web-listen", addr });
+            const term = sys.runInherit(argv.items, .{ .cwd = dir, .env = try haxyEnv(a, root, pf) }) catch |e|
                 return sys.fail("running haxy: {s}", .{sys.describe(e)});
             std.process.exit(sys.exitCode(term));
         },
@@ -290,7 +295,7 @@ fn haxyCmd(a: Allocator, root: []const u8, pfp: *core.Pullfile, cmd: cli.Cmd) !v
                 repo.close();
                 return o.writeAll(try runHaxy(a, root, pf, &.{ "haxy", "stack", "show", "--workspace", root, s.id }));
             }
-            const s, const infos = try stackWithPatches(a, root, pf, x.id);
+            const s, const infos = try haxy.stack.withPatches(a, root, pf, x.id);
             try st.writeStack(o, s, infos);
         },
         .haxy_merge => |x| {
@@ -309,7 +314,7 @@ fn haxyCmd(a: Allocator, root: []const u8, pfp: *core.Pullfile, cmd: cli.Cmd) !v
         },
         .haxy_pin => |x| try pinStack(a, root, pfp, x.id, x.message),
         .haxy_checkout => |x| if (opts.worktree) {
-            const s, const infos = try stackWithPatches(a, root, pf, x.id);
+            const s, const infos = try haxy.stack.withPatches(a, root, pf, x.id);
             const name = x.name orelse try std.fmt.allocPrint(a, "stack-{s}", .{s.id[0..@min(8, s.id.len)]});
             const dest = try worktree.path(a, root, name);
             if (!sys.exists(dest)) {
@@ -329,23 +334,6 @@ fn haxyCmd(a: Allocator, root: []const u8, pfp: *core.Pullfile, cmd: cli.Cmd) !v
         } else return sys.fail("built without the `worktree` feature", .{}),
         else => unreachable,
     }
-}
-
-/// A stack and its member patches as their repos' events have them.
-fn stackWithPatches(a: Allocator, root: []const u8, pf: core.Pullfile, id: []const u8) !struct { haxy.stack.Stack, []const ?haxy.stack.PatchInfo } {
-    const st = haxy.stack;
-    _, const repo = try st.openEvents(a, root, pf);
-    defer repo.close();
-    const s = try st.find(try st.stacks(a, repo), id);
-    const infos = try a.alloc(?st.PatchInfo, s.members.len);
-    for (s.members, infos) |m, *info| {
-        info.* = null;
-        const p = try std.fs.path.join(a, &.{ root, m.repo });
-        const r = git.Repo.open(a, p) catch continue;
-        defer r.close();
-        info.* = try st.patchInfo(a, r, m.patch_id);
-    }
-    return .{ s, infos };
 }
 
 /// Record a merged stack's commits as the pins, and commit the pullfile as `pull

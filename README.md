@@ -111,6 +111,8 @@ already committed; `git rm --cached` those.
     job                            start/stop/restart/unload pullfile jobs
     haxy_issues / haxy_issue / haxy_new_issue / haxy_comment / haxy_close /
     haxy_reopen / haxy_sync        haxy issues (below)
+    haxy_stacks / haxy_stack / haxy_patch /
+    haxy_merge                     haxy stacks (below)
 
 Register it with an agent, e.g. Hermes:
 
@@ -139,13 +141,48 @@ ycode-pull reads `pull mcp-servers` to register all of them in one go.
     pull haxy new REPO -t TITLE [-b BODY] [-l LABELS]
     pull haxy comment REPO ISSUE TEXT  |  close REPO ISSUE  |  reopen REPO ISSUE
     pull haxy sync [REPO...]                   fetch, fast-forward or merge, push
-    pull haxy open REPO                        run `haxy` (TUI + local web UI) there
+    pull haxy open [REPO]                      run `haxy` (TUI + local web UI) there,
+                                               or over the whole workspace
 
 ISSUE is an id or a unique prefix of one. Events are written as haxy's local mode writes
 them, with pull's identity (and GPG signature), so `haxy` reads them; sync is haxy's own
 (an empty-tree merge commit when both sides moved). Listing replays the events (local
 branch, else origin's); concurrent edits of one issue resolve by causal order then time,
 where haxy would flag a field conflict.
+
+## haxy stacks
+
+A stack is one change across several repos: a haxy patch per repo, merged together and
+pinned in one pullfile commit. It is a `stack` event naming the member patches, kept in
+the workspace's events repo: the root repo when the root is a git repo, else the repo
+the pullfile `haxy` section names:
+
+    <key>haxy</key>
+    <dict><key>events</key><string>dotenv</string></dict>
+
+The commands:
+
+    pull haxy patch [-t TITLE] [-b BODY] [-l LABELS] [--branch NAME]
+                                  a patch per repo with unmerged work on a branch other
+                                  than its pullfile one (or on NAME), and the stack
+    pull haxy stacks [--json]     every stack, newest first
+    pull haxy stack [--json] ID   members, their patches and pins (--json: haxy's view,
+                                  including whether each member merges)
+    pull haxy merge [-m MSG] ID   merge every member (all or nothing), then pin
+    pull haxy pin [-m MSG] ID     pin an already merged stack
+    pull haxy checkout ID [NAME]  a worktree (.worktrees/NAME) with each member on its
+                                  patch's branch
+
+pull runs haxy to create and merge stacks (`haxy stack new|merge`), so `haxy` must be on
+`PATH`. haxy merges the members into their target branches without touching the work
+trees, and records the merged commits on the stack. pull then pins those commits and
+commits the pullfile the way `pull commit` does: precommit hook, signed commit, postcommit
+hook. The message is the stack title, or `pin stack <id>` if lint rejects the title.
+Pinning refuses when repos already have staged changes, so the commit holds only the pins.
+A merged stack can't change. `pull haxy open` (no repo) shows the workspace in haxy's
+web UI, with stack pages under `/home/stacks` and a merge button that runs
+`pull haxy pin`. `pull haxy sync` also syncs the root repo's events when it holds the
+stacks.
 
 ## Jobs and sessions (launchd)
 

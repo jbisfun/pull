@@ -45,7 +45,9 @@ pub const ROOT = "(root)";
 
 pub fn eventsRepo(a: Allocator, root: []const u8, pf: core.Pullfile) !?EventsRepo {
     if (pf.sectionValue("haxy")) |v| if (v == .dict) if (v.dict.get("events")) |e| if (e == .string) {
-        if (pf.repo(e.string) == null) return sys.fail("pullfile haxy.events: no repo `{s}`", .{e.string});
+        for (pf.repos.items) |r| {
+            if (std.mem.eql(u8, r.name, e.string)) break;
+        } else return sys.fail("pullfile haxy.events: no repo `{s}`", .{e.string});
         return .{ .name = e.string, .path = try std.fs.path.join(a, &.{ root, e.string }) };
     };
     if (git.rootRepo(a, root)) |r| {
@@ -156,6 +158,23 @@ pub fn patchInfo(a: Allocator, repo: *git.Repo, patch_id: []const u8) !?PatchInf
         };
     }
     return info;
+}
+
+/// A stack (`id`, a unique prefix will do) and its member patches as their repos'
+/// events have them.
+pub fn withPatches(a: Allocator, root: []const u8, pf: core.Pullfile, id: []const u8) !struct { Stack, []const ?PatchInfo } {
+    _, const repo = try openEvents(a, root, pf);
+    defer repo.close();
+    const s = try find(try stacks(a, repo), id);
+    const infos = try a.alloc(?PatchInfo, s.members.len);
+    for (s.members, infos) |m, *info| {
+        info.* = null;
+        const p = try std.fs.path.join(a, &.{ root, m.repo });
+        const r = git.Repo.open(a, p) catch continue;
+        defer r.close();
+        info.* = try patchInfo(a, r, m.patch_id);
+    }
+    return .{ s, infos };
 }
 
 // ---------------------------------------------------------------- new stacks

@@ -6,7 +6,7 @@
 //! attach to the same terminal with `pull session attach`).
 //!
 //! The session/job tools need the `sessions` build option (pkgs/launchd), the
-//! haxy_* issue tools the `haxy` one (pkgs/haxy). The
+//! haxy_* issue and stack tools the `haxy` one (pkgs/haxy). The
 //! workspace env and the pullfile jobs are injected by the bin.
 const std = @import("std");
 const parley = @import("parley");
@@ -54,7 +54,7 @@ pub const instructions = "pull workspace: several git repos under one root, mana
     "`exec` runs a command to completion with the workspace env; sessions are stateful " ++
     "terminals (PTYs) that persist between calls and can be attached to by a human. " ++
     "Commit with `pull commit -m MSG PATHS` via exec (subject lint applies)." ++
-    (if (opts.haxy) " Repos with a `haxy/events` branch carry haxy issues: haxy_* tools." else "");
+    (if (opts.haxy) " Repos with a `haxy/events` branch carry haxy issues; changes across repos landed together are haxy stacks: haxy_* tools." else "");
 
 /// A tool as registered: its spec (schema byte for byte as the Rust server's
 /// schemars output), the fields its arguments are checked against, and its body.
@@ -136,5 +136,5 @@ test {
     _ = tools;
     if (opts.sessions) _ = sessions;
     if (opts.haxy) _ = haxy;
-    try std.testing.expect(defs().len == @as(usize, if (opts.sessions) 15 else 8) + if (opts.haxy) 7 else 0);
+    try std.testing.expect(defs().len == @as(usize, if (opts.sessions) 15 else 8) + if (opts.haxy) 11 else 0);
 }

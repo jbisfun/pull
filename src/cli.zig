@@ -60,7 +60,7 @@ pub const Cmd = union(enum) {
     haxy_comment: struct { repo: []const u8, issue: []const u8, text: []const u8 },
     haxy_status: struct { repo: []const u8, issue: []const u8, close: bool },
     /// No repo: the whole workspace (haxy's workspace mode).
-    haxy_open: ?[]const u8,
+    haxy_open: struct { repo: ?[]const u8, web_listen: ?[]const u8 = null },
     haxy_patch: struct { title: ?[]const u8, body: []const u8, labels: []const u8, branch: ?[]const u8 },
     haxy_stacks: struct { json: bool },
     haxy_stack: struct { id: []const u8, json: bool },
@@ -275,7 +275,7 @@ fn leafHelp(a: Allocator, path: []const u8) !?[]const u8 {
         .{ "haxy comment", .{ .about = aboutOf(&haxy_commands, "comment"), .usage = "pull haxy comment <REPO> <ISSUE> <TEXT>", .args = &.{ .{ "<REPO>", "" }, .{ "<ISSUE>", "Issue id (a unique prefix will do)" }, .{ "<TEXT>", "" } }, .options = &.{help_flag} } },
         .{ "haxy close", .{ .about = aboutOf(&haxy_commands, "close"), .usage = "pull haxy close <REPO> <ISSUE>", .args = &.{ .{ "<REPO>", "" }, .{ "<ISSUE>", "Issue id (a unique prefix will do)" } }, .options = &.{help_flag} } },
         .{ "haxy reopen", .{ .about = aboutOf(&haxy_commands, "reopen"), .usage = "pull haxy reopen <REPO> <ISSUE>", .args = &.{ .{ "<REPO>", "" }, .{ "<ISSUE>", "Issue id (a unique prefix will do)" } }, .options = &.{help_flag} } },
-        .{ "haxy open", .{ .about = aboutOf(&haxy_commands, "open"), .usage = "pull haxy open [REPO]", .args = &.{.{ "[REPO]", "Just this repo (default: the workspace)" }}, .options = &.{help_flag} } },
+        .{ "haxy open", .{ .about = aboutOf(&haxy_commands, "open"), .usage = "pull haxy open [OPTIONS] [REPO]", .args = &.{.{ "[REPO]", "Just this repo (default: the workspace)" }}, .options = &.{ .{ "    --web-listen <ADDR>", "No TUI: serve only the web UI on ADDR (e.g. 127.0.0.1:8080) until killed, for a job" }, help_flag } } },
         .{ "haxy patch", .{ .about = aboutOf(&haxy_commands, "patch"), .usage = "pull haxy patch [OPTIONS]", .args = &.{}, .options = &.{ .{ "-t, --title <TITLE>", "Default: the branch name" }, .{ "-b, --body <BODY>", "Description (markdown)" }, .{ "-l, --labels <LABELS>", "Space-separated" }, .{ "    --branch <NAME>", "Repos with this branch (default: repos checked out on a branch other than their pullfile one)" }, help_flag } } },
         .{ "haxy stacks", .{ .about = aboutOf(&haxy_commands, "stacks"), .usage = "pull haxy stacks [OPTIONS]", .args = &.{}, .options = &.{ .{ "    --json", "Machine-readable: {root, stacks: [{author, created, description, id, labels, members, pins, status, title, updated}]}" }, help_flag } } },
         .{ "haxy stack", .{ .about = aboutOf(&haxy_commands, "stack"), .usage = "pull haxy stack [OPTIONS] <STACK>", .args = &.{.{ "<STACK>", "Stack id (a unique prefix will do)" }}, .options = &.{ .{ "    --json", "haxy's view: each member's patch and whether it merges" }, help_flag } } },
@@ -823,8 +823,13 @@ fn parseHaxy(a: Allocator, sub: []const u8, iter: *ArgIter) !Cmd {
         return .{ .haxy_new = .{ .repo = repo, .title = title, .body = res.args.body orelse "", .labels = res.args.labels orelse "" } };
     }
     if (eq(u8, sub, "open")) {
-        const res = try parseSub(a, "haxy open", &positional, iter);
-        return .{ .haxy_open = try one(a, "haxy open", res.positionals[0]) };
+        const res = try parseSub(a, "haxy open", &comptime clap.parseParamsComptime(
+            \\-h, --help
+            \\--web-listen <str>
+            \\<str>...
+            \\
+        ), iter);
+        return .{ .haxy_open = .{ .repo = try one(a, "haxy open", res.positionals[0]), .web_listen = res.args.@"web-listen" } };
     }
     if (eq(u8, sub, "patch")) {
         const res = try parseSub(a, "haxy patch", &comptime clap.parseParamsComptime(

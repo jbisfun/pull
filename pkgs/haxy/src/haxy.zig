@@ -166,12 +166,12 @@ pub fn splitLabels(a: Allocator, labels: []const u8) ![]const []const u8 {
     return out.items;
 }
 
-const Event = struct { oid: Oid, gen: u64, commit: git.Repo.Commit };
+const Node = struct { oid: Oid, gen: u64, commit: git.Repo.Commit };
 
 /// Every commit reachable from `head`, parents before children: by generation
 /// (haxy's event order: one more than the highest parent's), then commit time.
 fn replayOrder(a: Allocator, repo: *git.Repo, head: Oid) ![]git.Repo.Commit {
-    var commits: std.AutoArrayHashMapUnmanaged(Oid, Event) = .empty;
+    var commits: std.AutoArrayHashMapUnmanaged(Oid, Node) = .empty;
     var todo: std.ArrayList(Oid) = .empty;
     try todo.append(a, head);
     while (todo.pop()) |oid| {
@@ -203,16 +203,16 @@ fn replayOrder(a: Allocator, repo: *git.Repo, head: Oid) ![]git.Repo.Commit {
             _ = todo.pop();
         }
     }
-    const events = try a.dupe(Event, commits.values());
-    std.mem.sort(Event, events, {}, struct {
-        fn lt(_: void, x: Event, y: Event) bool {
+    const nodes = try a.dupe(Node, commits.values());
+    std.mem.sort(Node, nodes, {}, struct {
+        fn lt(_: void, x: Node, y: Node) bool {
             if (x.gen != y.gen) return x.gen < y.gen;
             if (x.commit.time != y.commit.time) return x.commit.time < y.commit.time;
             return std.mem.lessThan(u8, &x.oid, &y.oid);
         }
     }.lt);
-    const out = try a.alloc(git.Repo.Commit, events.len);
-    for (out, events) |*o, e| o.* = e.commit;
+    const out = try a.alloc(git.Repo.Commit, nodes.len);
+    for (out, nodes) |*o, e| o.* = e.commit;
     return out;
 }
 
